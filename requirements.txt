@@ -1,0 +1,19 @@
+# Existing app dependencies
+streamlit>=1.31  # st.dialog (the QA table "Expand" popup) requires 1.31+
+pandas
+beautifulsoup4
+openpyxl
+
+# Advanced QA modules
+opencv-python-headless
+scikit-image
+numpy
+Pillow
+pdf2image
+pytesseract
+pymupdf  # required for mixed-PDF master page auto-detection (import fitz)
+
+# NOTE: PaddleOCR (paddleocr / paddlepaddle) is intentionally NOT included.
+# It does not reliably install on Streamlit Community Cloud's build image.
+# ocr_engine.py already auto-falls-back to pytesseract with no code changes
+# needed if PaddleOCR isn't present, so the app works fully without it.
