@@ -1,0 +1,7 @@
+[server]
+maxUploadSize = 5120          # 5 GB in MB
+maxMessageSize = 5120         # must match or exceed maxUploadSize
+enableXsrfProtection = false  # needed for large multipart uploads
+
+[browser]
+gatherUsageStats = false
