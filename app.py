@@ -2052,10 +2052,11 @@ if run:
                 continue
 
             if dealer_mismatch:
-                auto_label = f"**{auto_detected_dealer_row.dealer}**" if auto_detected_dealer_row else "*(could not be auto-detected)*"
+                auto_label = f"<strong>{auto_detected_dealer_row.dealer}</strong>" if auto_detected_dealer_row else "<em>(could not be auto-detected)</em>"
                 st.markdown(
                     f"<div style='color:#c00000;font-weight:bold;padding:10px;border:2px solid #c00000;"
-                    f"border-radius:4px;background-color:#fff0f0;'>"
+                    f"border-radius:4px;background-color:#fff0f0;"
+                    f"box-sizing:border-box;width:100%;max-width:100%;overflow-wrap:break-word;'>"
                     f"⚠ SELECTED DEALER MISMATCH — This email's HTML actually belongs to {auto_label}, "
                     f"but you selected <strong>{dealer_row.dealer}</strong> ({dealer_row.region}) from the "
                     f"Dealer Selection dropdown. Every Excel-comparable check below is being run against "
@@ -2087,6 +2088,7 @@ if run:
             dealer_name=dealer_row.dealer,
             panel_text=dealer_row.panel_text,
             html_raw=job["html"],
+            dealer_mismatch=dealer_mismatch,
         )
         if website_link_result.rows:
             website_link_df = pd.DataFrame(website_link_result.rows)
@@ -2102,6 +2104,31 @@ if run:
                 results_df["detail"] = ""
             results_df = pd.concat([results_df, website_link_df], ignore_index=True)
             results_df["detail"] = results_df["detail"].fillna("")
+        elif "detail" not in results_df.columns:
+            results_df["detail"] = ""
+
+        # When the dropdown-SELECTED dealer doesn't match the dealer this
+        # email's HTML actually belongs to (dealer_mismatch, computed
+        # above), every "Missing" row AND every website-link-QA "Fail"
+        # row in Content QA is collapsed onto the SAME single shared
+        # explanation. "Missing" additionally becomes "Fail" — the
+        # content isn't merely absent, it's actively wrong for the
+        # selected dealer, which is a stronger, more accurate signal for
+        # a reviewer scanning Pass/Fail/Warn at a glance. Repeating a
+        # near-identical per-row detail for every one of the dozens of
+        # mismatched lines added no information beyond what the mismatch
+        # banner above the table already explains, so all of them share
+        # one message instead.
+        if dealer_mismatch:
+            missing_mask = results_df["status"] == "Missing"
+            results_df.loc[missing_mask, "status"] = "Fail"
+            combined_mismatch_detail = (
+                f"Dealer mismatch — this email's HTML belongs to "
+                f"{auto_detected_dealer_row.dealer if auto_detected_dealer_row else 'a different dealer'}, "
+                f"not the selected dealer ({dealer_row.dealer}). See the mismatch warning above."
+            )
+            fail_mask = results_df["status"] == "Fail"
+            results_df.loc[fail_mask, "detail"] = combined_mismatch_detail
 
         total = len(results_df)
         # "Present" covers both the original fuzzy-match status value AND

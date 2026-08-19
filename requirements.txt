@@ -4,16 +4,25 @@ pandas
 beautifulsoup4
 openpyxl
 
-# Advanced QA modules
+# New — Advanced QA modules
 opencv-python-headless
 scikit-image
 numpy
 Pillow
 pdf2image
 pytesseract
-pymupdf  # required for mixed-PDF master page auto-detection (import fitz)
+pymupdf  # required for mixed-PDF master page auto-detection — used by both visual_qa.find_email_page_in_pdf and modules/master_pdf.py (import fitz)
 
-# NOTE: PaddleOCR (paddleocr / paddlepaddle) is intentionally NOT included.
-# It does not reliably install on Streamlit Community Cloud's build image.
-# ocr_engine.py already auto-falls-back to pytesseract with no code changes
-# needed if PaddleOCR isn't present, so the app works fully without it.
+# Optional but recommended — better OCR accuracy/speed than Tesseract.
+# NOT included in this file's automatic install because paddlepaddle does
+# not yet publish wheels for every Python version (e.g. Python 3.14 on
+# Windows will fail with "No matching distribution found for paddlepaddle").
+# If you skip this package, the app automatically falls back to
+# pytesseract with no code changes — nothing else in this file needs it.
+#
+# To try it manually, first check your Python version:
+#   python --version
+# Then, ONLY if you are on Python 3.9–3.12, run:
+#   pip install paddleocr paddlepaddle
+# If that fails with "No matching distribution", your Python version isn't
+# supported by paddlepaddle yet — just skip it, Tesseract will be used.

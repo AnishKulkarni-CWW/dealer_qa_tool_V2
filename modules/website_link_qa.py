@@ -157,6 +157,41 @@ def run_website_link_qa(dealer_name: str, panel_text: str, html_raw: str) -> Web
     If dealer_name is empty, all three are skipped (returns no rows) —
     there is nothing to validate against.
     """
+def run_website_link_qa(
+    dealer_name: str,
+    panel_text: str,
+    html_raw: str,
+    dealer_mismatch: bool = False,
+) -> WebsiteLinkQAResult:
+    """
+    Produces up to 3 Content-QA-style rows (item/status/detail), inserted
+    right after the existing 'Website: ...' Content QA row:
+      1. Dealer Panel Website matches dealer name
+      2. CTA Button Link matches dealer name
+      3. CTA Button Link matches Dealer Panel Website
+    If dealer_name is empty, all three are skipped (returns no rows) —
+    there is nothing to validate against.
+
+    `dealer_mismatch`: True when the dropdown-SELECTED dealer (whose
+    `panel_text` this function was given — it always comes straight from
+    the Excel sheet, see app.py's call site) is NOT the dealer this
+    email's HTML actually belongs to (per the app's existing
+    auto-detected-vs-selected comparison). This must be passed in
+    explicitly because Row 1 (Dealer Panel Website vs dealer name) reads
+    `panel_text`, which is ALWAYS the selected dealer's own Excel data —
+    it never looks at the HTML at all. Without this flag, Row 1 is a
+    tautology (an Excel cell's website always "corresponds to" that same
+    cell's own dealer name) and would incorrectly PASS even when the
+    email on screen is a completely different dealer's email — exactly
+    the bug this parameter exists to close. When True, Row 1 (and Row 3,
+    the CTA-vs-panel cross-check, which is equally meaningless when the
+    panel itself isn't even the right dealer's panel) are forced to
+    "Fail" regardless of what their own domain-matching would otherwise
+    conclude, since the panel being shown is definitionally the wrong
+    one for this email. Row 2 (CTA Button vs dealer name) is NOT forced
+    here — it already independently reads the HTML's actual CTA href, so
+    it already correctly fails/passes on its own real signal.
+    """
     rows: List[dict] = []
     if not dealer_name or not dealer_name.strip():
         return WebsiteLinkQAResult(rows=rows)
@@ -173,6 +208,16 @@ def run_website_link_qa(dealer_name: str, panel_text: str, html_raw: str) -> Web
             "item": "Website check (Dealer Panel): no website line found",
             "status": "Warn",
             "detail": f"No 'Website:' line with a URL could be found in {dealer_name}'s dealer panel text.",
+        })
+    elif dealer_mismatch:
+        rows.append({
+            "item": f"Website check (Dealer Panel): {panel_website_raw}",
+            "status": "Fail",
+            "detail": (
+                f"Dealer mismatch — the Dealer Panel data (including this Website line) belongs to the "
+                f"SELECTED dealer '{dealer_name}', but this email's HTML is not that dealer's email, so this "
+                f"panel/website should not be considered validated for what's actually on screen."
+            ),
         })
     else:
         ok = _domain_matches_dealer(panel_domain, dealer_name)
@@ -212,13 +257,19 @@ def run_website_link_qa(dealer_name: str, panel_text: str, html_raw: str) -> Web
     # ---- Row 3: CTA Button Link vs Dealer Panel Website (cross-check) ----
     if panel_domain is not None and cta_domain is not None:
         ok = panel_domain == cta_domain
+        detail = (
+            f"CTA button domain ('{cta_domain}') "
+            f"{'matches' if ok else 'does NOT match'} the Dealer Panel website domain ('{panel_domain}')."
+        )
+        if dealer_mismatch and not ok:
+            detail += (
+                f" This is expected: the Dealer Panel shown belongs to the SELECTED dealer "
+                f"'{dealer_name}', not the dealer this email's HTML actually belongs to."
+            )
         rows.append({
             "item": f"Website check (CTA vs Panel match): {cta_domain} vs {panel_domain}",
             "status": "Pass" if ok else "Fail",
-            "detail": (
-                f"CTA button domain ('{cta_domain}') "
-                f"{'matches' if ok else 'does NOT match'} the Dealer Panel website domain ('{panel_domain}')."
-            ),
+            "detail": detail,
         })
 
     return WebsiteLinkQAResult(rows=rows)
