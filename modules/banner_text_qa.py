@@ -33,6 +33,26 @@ gets swept into the Subheadline band's OCR text since it's the next
 distinct line, which then either fails the Subheadline check outright
 (unexpected extra words) or wrongly counts as passing it.
 
+--------------------------------------------------------------------------
+Content-aware Dealer Name line matching (font-size-tie fix)
+--------------------------------------------------------------------------
+Font-size banding alone still isn't enough on its own: real banners
+frequently render Subheadline and Dealer Name at THE SAME font size
+(e.g. "BMW FUEL ADDITIVES." and "Bavaria Motors" both OCR at a matching
+17px line height), which collapses them into a single band with no
+dedicated Dealer Name band at all — a plain "split the last line off"
+positional guess then risks wrongly chopping a genuinely multi-line
+Subheadline that has no dealer name on it at all.
+
+Instead, whenever `expected_dealer_name` is known, this module calls
+`ocr_engine.find_dealer_line()` directly against every raw OCR'd line
+available on `clustered_lines` (across ALL bands, not just Subheadline's)
+to find the one line whose words actually match the expected dealer
+name by content, not by position. This is strictly additive: a banner
+with no dealer name rendered at all will simply find no match and fall
+through to the prior band-based behaviour unchanged, so nothing is ever
+invented that isn't really there.
+
 Backward compatibility: `run_banner_text_qa` still accepts a plain OCR
 string via `ocr_text` for the Dealer Name check and as a fallback if no
 clustered data is supplied (old call sites keep working, just without
@@ -43,6 +63,7 @@ import re
 from dataclasses import dataclass
 from typing import List, Optional
 
+from . import ocr_engine as _ocr_engine
 from .config import DEFAULT_CONFIG
 from .results import ModuleResult, PASS, FAIL, WARN
 
@@ -143,31 +164,55 @@ def run_banner_text_qa(
         expected_headline = _strip_trailing_dealer_name(expected_headline, expected_dealer_name)
 
     if clustered_lines is not None:
-        headline_found = clustered_lines.headline_text
-        subheadline_found = clustered_lines.subheadline_text
-        # Third band (everything smaller than Subheadline) = Dealer Name.
-        dealer_found = clustered_lines.other_text
+        headline_lines = list(clustered_lines.headline_lines)
+        subheadline_lines = list(clustered_lines.subheadline_lines)
+        other_lines = list(clustered_lines.other_lines)
 
-        # Defensive cross-band cleanup: if a caller-supplied clustering
-        # still has stray overlap (e.g. exactly 2 bands were detected
-        # instead of 3, so Dealer Name text ended up bundled into the
-        # Subheadline band), strip out any line that's an exact match to
-        # another band's own lines before falling back to the whole blob.
-        # This keeps each row's "found" column limited to only its own
-        # band text instead of leaking neighbouring rows' text into it.
-        headline_line_texts = {l.text.strip() for l in clustered_lines.headline_lines}
-        subheadline_line_texts = {l.text.strip() for l in clustered_lines.subheadline_lines}
-        dealer_line_texts = {l.text.strip() for l in clustered_lines.other_lines}
+        # Content-aware Dealer Name line search: look across ALL bands'
+        # raw lines (not just whichever band geometry happened to place
+        # it in) for the one line whose words actually match the
+        # expected dealer name. This is the authoritative source for
+        # `dealer_found` whenever it succeeds — far more reliable than a
+        # positional "last line of Subheadline" guess, since it only
+        # ever matches a line that genuinely contains the dealer name's
+        # words, in either direction (see find_dealer_line() docstring
+        # in ocr_engine.py for the full rationale).
+        dealer_match_line = None
+        if expected_dealer_name.strip():
+            all_band_lines = (
+                (getattr(clustered_lines, "headline_lines", None) or [])
+                + (getattr(clustered_lines, "subheadline_lines", None) or [])
+                + (getattr(clustered_lines, "other_lines", None) or [])
+            )
+            # A caller that already ran extract_clustered_text() WITH
+            # expected_dealer_name will have this pre-populated — reuse
+            # it directly rather than re-searching. Otherwise (e.g. an
+            # older clustering built without the dealer name known yet)
+            # search now, across every line we can see.
+            pre_matched = getattr(clustered_lines, "dealer_line", None)
+            dealer_match_line = pre_matched or _ocr_engine.find_dealer_line(
+                all_band_lines, expected_dealer_name
+            )
 
-        # If Dealer Name has no band of its own but Subheadline's band
-        # has more than one line, and the expected dealer name's words
-        # only match a subset of those lines, split the LAST line of the
-        # Subheadline band off as the Dealer Name candidate instead of
-        # letting the whole Subheadline band double as both fields.
-        if not dealer_line_texts and len(clustered_lines.subheadline_lines) > 1 and expected_dealer_name.strip():
-            *sub_lines_kept, last_line = sorted(clustered_lines.subheadline_lines, key=lambda l: l.top)
-            subheadline_found = " ".join(l.text for l in sub_lines_kept)
-            dealer_found = last_line.text
+        if dealer_match_line is not None:
+            # Remove the matched line from whichever band it's still
+            # sitting in (by identity, so a repeated line of the same
+            # text elsewhere on the banner isn't also stripped out) so
+            # it never also pollutes Headline/Subheadline's own text.
+            headline_lines = [l for l in headline_lines if l is not dealer_match_line]
+            subheadline_lines = [l for l in subheadline_lines if l is not dealer_match_line]
+            other_lines = [l for l in other_lines if l is not dealer_match_line]
+            dealer_found = dealer_match_line.text
+        else:
+            # No confident content match — fall back to whatever
+            # geometric band(s) the OCR engine assigned as "smaller than
+            # Subheadline", same as the original behaviour. If there
+            # isn't one, `dealer_found` stays empty here and is picked
+            # up by the single-band whole-blob fallback further below.
+            dealer_found = " ".join(l.text for l in other_lines)
+
+        headline_found = " ".join(l.text for l in headline_lines)
+        subheadline_found = " ".join(l.text for l in subheadline_lines)
 
         # If OCR only detected a single font band (e.g. banner really only
         # has one line of text), fall back to the whole blob for whichever
@@ -179,11 +224,16 @@ def run_banner_text_qa(
             subheadline_found = ocr_text
         if expected_dealer_name.strip() and not dealer_found.strip():
             dealer_found = ocr_text
+
+        if dealer_match_line is not None:
+            dealer_match_note = "the Dealer Name line was identified by matching its words against the expected dealer name (content-aware match, independent of font-size band)"
+        else:
+            dealer_match_note = f"{len(clustered_lines.other_lines)} dealer-name-band line(s) used (font-size band only — no confident content match found)"
         note = (
-            f"Headline/Subheadline/Dealer Name matched separately by OCR font-size band "
+            f"Headline/Subheadline matched by OCR font-size band "
             f"(engine detected {len(clustered_lines.headline_lines)} headline-band line(s), "
-            f"{len(clustered_lines.subheadline_lines)} subheadline-band line(s), "
-            f"{len(clustered_lines.other_lines)} dealer-name-band line(s))."
+            f"{len(clustered_lines.subheadline_lines)} subheadline-band line(s)); "
+            f"{dealer_match_note}."
         )
         result.notes.append(note)
     else:

@@ -2303,20 +2303,42 @@ if run:
                 ext_master_banner_clustered_lines = None
                 ext_master_ocr_warning = ""
 
+                # A dealer-name HINT to search for while OCR'ing the Master
+                # Banner, if one is already known at this point (Dealer
+                # Dropdown selection, or a typed Manual Dealer Name) — see
+                # ocr_engine.find_dealer_line() / cluster_lines_by_size()'s
+                # `expected_dealer_name` param. This does NOT change the
+                # documented priority order below (dropdown/manual still
+                # always win as the FINAL effective_dealer_name); it only
+                # makes the OCR clustering itself smarter at locating the
+                # correct line on the banner when a Subheadline and Dealer
+                # Name happen to render at the same font size — which plain
+                # font-size banding alone cannot always tell apart (see
+                # ocr_engine.py's cluster_lines_by_size docstring).
+                _master_dealer_name_hint = (
+                    _dropdown_dealer_name.strip() if _dropdown_dealer_name.strip()
+                    else ext_manual_master.dealer_name.strip()
+                )
+
                 if ext_master_banner_img is not None:
                     try:
                         ext_master_banner_clustered_lines, _master_lines_res = ext_ocr.extract_clustered_text(
-                            ext_master_banner_img, prefer=EXT_OCR_PREFER_KEY
+                            ext_master_banner_img, prefer=EXT_OCR_PREFER_KEY,
+                            expected_dealer_name=_master_dealer_name_hint,
                         )
                         master_derived_headline = ext_master_banner_clustered_lines.headline_text
                         master_derived_subheadline = ext_master_banner_clustered_lines.subheadline_text
-                        # The dealer name is typically the smallest/third font
-                        # band under Headline/Subheadline (see banner_text_qa.py's
-                        # own band-splitting notes) — use it as the master-derived
-                        # dealer name when nothing more explicit (dropdown/manual)
-                        # is available, so a Master JPG/PDF alone can still supply
-                        # a dealer name for validation.
-                        master_derived_dealer_name = ext_master_banner_clustered_lines.other_text
+                        # `dealer_text` prefers the content-matched dealer
+                        # line (found by searching all OCR'd lines for the
+                        # `_master_dealer_name_hint`'s words, regardless of
+                        # which font-size band it landed in) and only falls
+                        # back to the plain smallest-font-band guess when no
+                        # hint was available or no confident match was
+                        # found — so a Master JPG/PDF/HTML ZIP alone can
+                        # still supply a reliable dealer name for
+                        # validation even when Subheadline and Dealer Name
+                        # share a font size on the banner.
+                        master_derived_dealer_name = ext_master_banner_clustered_lines.dealer_text
                         if _master_lines_res.warning:
                             ext_master_ocr_warning = _master_lines_res.warning
                     except Exception as e:
@@ -2386,9 +2408,26 @@ if run:
                     # can be matched against their own font-size band instead of
                     # the whole banner text blob (fixes headline+subheadline
                     # being treated as one combined string).
+                    #
+                    # `expected_dealer_name` is passed here too (same hint
+                    # already resolved above as `effective_dealer_name` —
+                    # dropdown > manual > master-derived, per the documented
+                    # priority order) so the Dealer Name line is located by
+                    # content-matching its words across ALL font bands, not
+                    # just whichever band plain font-size clustering happened
+                    # to place it in. This matters because a banner's
+                    # Subheadline and Dealer Name commonly render at the
+                    # SAME font size (see ocr_engine.py's
+                    # cluster_lines_by_size docstring) — without this hint,
+                    # the two would still get merged into a single band
+                    # here, relying entirely on banner_text_qa.py's own
+                    # fallback re-search to recover the Dealer Name. Passing
+                    # it here fixes it at the source as well, so both
+                    # layers agree and neither is a single point of failure.
                     try:
                         ext_input_banner_clustered_lines, _lines_res = ext_ocr.extract_clustered_text(
-                            ext_input_banner_img, prefer=EXT_OCR_PREFER_KEY
+                            ext_input_banner_img, prefer=EXT_OCR_PREFER_KEY,
+                            expected_dealer_name=effective_dealer_name,
                         )
                     except Exception:
                         ext_input_banner_clustered_lines = None

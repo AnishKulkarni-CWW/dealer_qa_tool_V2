@@ -80,6 +80,13 @@ class ClusteredLines:
     headline_lines: List[TextLine] = field(default_factory=list)
     subheadline_lines: List[TextLine] = field(default_factory=list)
     other_lines: List[TextLine] = field(default_factory=list)
+    # Populated only when `cluster_lines_by_size()` / `extract_clustered_text()`
+    # was called WITH an `expected_dealer_name` and a matching line was found
+    # anywhere among the OCR'd lines (see `find_dealer_line()` below). Kept
+    # separate from `other_lines` because a content-matched dealer line is a
+    # much stronger signal than "whatever fell into the smallest font band" —
+    # callers should prefer this field when it is non-empty.
+    dealer_line: Optional["TextLine"] = None
 
     @property
     def headline_text(self) -> str:
@@ -94,6 +101,19 @@ class ClusteredLines:
         return " ".join(l.text for l in self.other_lines)
 
     @property
+    def dealer_text(self) -> str:
+        """
+        Best available Dealer Name text: the content-matched `dealer_line`
+        if one was found (most reliable — see `find_dealer_line()`),
+        otherwise whatever fell into the geometric `other_lines` band
+        (font-size-only guess, kept as a fallback for when no expected
+        dealer name was supplied to match against).
+        """
+        if self.dealer_line is not None:
+            return self.dealer_line.text
+        return self.other_text
+
+    @property
     def all_text(self) -> str:
         # preserves top-to-bottom reading order across all bands
         all_lines = sorted(
@@ -101,6 +121,91 @@ class ClusteredLines:
             key=lambda l: l.top,
         )
         return "\n".join(l.text for l in all_lines)
+
+
+def _dealer_name_tokens(text: str) -> set:
+    return set(re.findall(r"[A-Za-z0-9]+", (text or "").lower()))
+
+
+def find_dealer_line(
+    lines: List[TextLine],
+    expected_dealer_name: str,
+    min_ratio: float = 0.7,
+) -> Optional[TextLine]:
+    """
+    Content-aware Dealer Name line finder — scans ALL OCR'd lines (not
+    just one font-size band) for the single line whose words most
+    strongly match `expected_dealer_name`, and returns that `TextLine`
+    (or None if nothing matches well enough).
+
+    --------------------------------------------------------------------
+    Why this exists / why geometry (font-size band) alone isn't enough
+    --------------------------------------------------------------------
+    `cluster_lines_by_size()` groups lines purely by relative font
+    height. That works well for Headline vs Subheadline (which are
+    usually a clearly different size), but real banners frequently
+    render the Subheadline and Dealer Name at THE SAME size (e.g. a
+    banner reading "BMW FUEL ADDITIVES." directly above "Bavaria
+    Motors" at matching 17px OCR'd heights) — two genuinely different
+    lines that height-only clustering cannot tell apart, so they get
+    merged into a single band and the Dealer Name is lost.
+
+    A pixel-geometry fix (e.g. "look for an unusually large vertical
+    gap within a same-height group") was tried and rejected: real
+    banners don't have a consistent gap-to-height ratio that reliably
+    separates "a wrapped second line of the same block of copy" from
+    "a new, distinct element below it" — the ratio for a genuine
+    wrapped line on one banner can be numerically closer to the ratio
+    for a genuine new-element break on another banner than either is
+    to its own category. Any single threshold ends up right for some
+    banners and wrong for others.
+
+    Content matching sidesteps the geometry problem entirely: whenever
+    an expected Dealer Name is available (dropdown / Manual Text /
+    Excel), we already know what we're looking for, so we search for
+    it directly by matching tokens rather than guessing from pixel
+    size/position. This is strictly additive — it only ever "finds" a
+    line when there's real word-level evidence for it, so a banner
+    with no dealer name rendered at all correctly returns None instead
+    of guessing.
+
+    Matching is bidirectional (checked both ways):
+      - most of the expected dealer name's own words must appear in
+        the candidate line (so a line missing key dealer-name words
+        doesn't match), AND
+      - most of the candidate line's words must belong to the dealer
+        name (so a long, unrelated line that merely happens to
+        contain one shared word — e.g. a stray "BMW" — doesn't match).
+    Both directions use the same `min_ratio` (default 0.7, matching
+    the token-overlap fallback ratio already used elsewhere in this
+    codebase for dealer-name matching, e.g. dealer_select.py).
+
+    If more than one line meets the threshold, the single BEST-matching
+    line (highest combined overlap ratio) is returned — real banners
+    have at most one dealer-name line, so ties are broken toward the
+    strongest match rather than the first/last positionally.
+    """
+    d_tokens = _dealer_name_tokens(expected_dealer_name)
+    if not d_tokens or not lines:
+        return None
+
+    best_line = None
+    best_score = 0.0
+    for line in lines:
+        l_tokens = _dealer_name_tokens(line.text)
+        if not l_tokens:
+            continue
+        overlap = d_tokens & l_tokens
+        if not overlap:
+            continue
+        ratio_of_expected = len(overlap) / len(d_tokens)
+        ratio_of_line = len(overlap) / len(l_tokens)
+        if ratio_of_expected >= min_ratio and ratio_of_line >= min_ratio:
+            score = ratio_of_expected + ratio_of_line
+            if score > best_score:
+                best_score = score
+                best_line = line
+    return best_line
 
 
 def _try_load_paddleocr():
@@ -326,7 +431,11 @@ def extract_lines(image: Image.Image, prefer: str = "paddleocr") -> LinesResult:
         return LinesResult(lines=[], engine_used="none", warning=f"OCR unavailable: {e}")
 
 
-def cluster_lines_by_size(lines_result: LinesResult, jitter_tolerance_ratio: float = 0.08) -> ClusteredLines:
+def cluster_lines_by_size(
+    lines_result: LinesResult,
+    jitter_tolerance_ratio: float = 0.08,
+    expected_dealer_name: str = "",
+) -> ClusteredLines:
     """
     Groups OCR'd lines into Headline (largest font band), Subheadline
     (next distinct, smaller font band), and Dealer Name / Other (any
@@ -363,6 +472,28 @@ def cluster_lines_by_size(lines_result: LinesResult, jitter_tolerance_ratio: flo
 
     Band 1 = Headline, Band 2 = Subheadline, Band 3 (if present) =
     Dealer Name / Other.
+
+    --------------------------------------------------------------------
+    `expected_dealer_name` — content-aware dealer-line correction
+    --------------------------------------------------------------------
+    Font-size geometry alone cannot always separate Subheadline from
+    Dealer Name: real banners commonly render both at THE SAME size
+    (e.g. "BMW FUEL ADDITIVES." directly above "Bavaria Motors" at
+    matching OCR'd heights), so height-only clustering merges them into
+    one band and no dedicated Dealer Name band ever forms.
+
+    When `expected_dealer_name` is supplied (non-empty), this runs
+    `find_dealer_line()` across ALL OCR'd lines — regardless of which
+    band they landed in — looking for a line whose words strongly match
+    the expected name. If a confident match is found, that exact line
+    is moved out of whichever band it was sitting in (so it never also
+    pollutes Headline/Subheadline text) and recorded on
+    `clustered.dealer_line`. This is purely additive/corrective: if no
+    confident content match is found (e.g. no dealer name is actually
+    shown on this banner), the original geometric bands are returned
+    completely unchanged, so a banner without a dealer name never gets
+    a false dealer line invented for it, and existing behaviour when no
+    `expected_dealer_name` is passed at all is identical to before.
     """
     clustered = ClusteredLines()
     if not lines_result.lines:
@@ -392,6 +523,7 @@ def cluster_lines_by_size(lines_result: LinesResult, jitter_tolerance_ratio: flo
 
     if len(size_groups) == 1:
         clustered.headline_lines = sorted(size_groups[0], key=lambda l: l.top)
+        _apply_content_aware_dealer_match(clustered, lines_result.lines, expected_dealer_name)
         return clustered
 
     # Step 2: proportional gap between each consecutive pair of distinct
@@ -425,16 +557,59 @@ def cluster_lines_by_size(lines_result: LinesResult, jitter_tolerance_ratio: flo
         remaining = [l for band in bands[2:] for l in band]
         clustered.other_lines = sorted(remaining, key=lambda l: l.top)
 
+    _apply_content_aware_dealer_match(clustered, lines_result.lines, expected_dealer_name)
     return clustered
 
 
-def extract_clustered_text(image: Image.Image, prefer: str = "paddleocr",
-                            jitter_tolerance_ratio: float = 0.08) -> Tuple[ClusteredLines, LinesResult]:
+def _apply_content_aware_dealer_match(
+    clustered: ClusteredLines,
+    all_lines: List[TextLine],
+    expected_dealer_name: str,
+) -> None:
+    """
+    Shared helper used by both branches of `cluster_lines_by_size()`
+    (single-band and multi-band). Searches every OCR'd line for the
+    expected dealer name via `find_dealer_line()`; if found, sets
+    `clustered.dealer_line` and removes that exact line from whichever
+    geometric band it was sitting in (matched by identity via `is`, so
+    an OCR line whose text happens to repeat elsewhere on the banner
+    isn't accidentally also removed). No-op if `expected_dealer_name`
+    is blank or no confident match exists.
+    """
+    if not expected_dealer_name or not expected_dealer_name.strip():
+        return
+    match = find_dealer_line(all_lines, expected_dealer_name)
+    if match is None:
+        return
+    clustered.dealer_line = match
+    clustered.headline_lines = [l for l in clustered.headline_lines if l is not match]
+    clustered.subheadline_lines = [l for l in clustered.subheadline_lines if l is not match]
+    clustered.other_lines = [l for l in clustered.other_lines if l is not match]
+
+
+def extract_clustered_text(
+    image: Image.Image,
+    prefer: str = "paddleocr",
+    jitter_tolerance_ratio: float = 0.08,
+    expected_dealer_name: str = "",
+) -> Tuple[ClusteredLines, LinesResult]:
     """
     Convenience wrapper: OCRs the banner and returns both the size-based
     line clusters and the raw LinesResult (for the flat "found" text /
     warnings callers may still want to display).
+
+    `expected_dealer_name` is optional and passed straight through to
+    `cluster_lines_by_size()` for content-aware dealer-line correction
+    (see that function's docstring) — pass it whenever a dealer name is
+    already known (dropdown / Manual Text / Excel) so the Dealer Name
+    band is reliable even when it shares a font size with the
+    Subheadline. Omitting it preserves the exact prior behaviour
+    (geometric-only banding).
     """
     lines_result = extract_lines(image, prefer=prefer)
-    clustered = cluster_lines_by_size(lines_result, jitter_tolerance_ratio=jitter_tolerance_ratio)
+    clustered = cluster_lines_by_size(
+        lines_result,
+        jitter_tolerance_ratio=jitter_tolerance_ratio,
+        expected_dealer_name=expected_dealer_name,
+    )
     return clustered, lines_result
