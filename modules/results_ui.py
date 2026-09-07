@@ -1,205 +1,289 @@
 """
-Feature 15 — Result Screen (tabs).
+Shared Streamlit rendering for every QA result table.
 
-Reusable rendering helpers so app.py doesn't need to hand-roll Streamlit
-widgets for every module — one function renders a ModuleResult consistently
-everywhere it's used (Dealer Panel QA / Body QA / Banner QA / Visual QA /
-OCR QA / Summary).
+Why the implementation lives here rather than in app.py: the same three
+shapes of result get rendered in half a dozen places (Content QA, Exact
+Match QA, Styling QA, and each Advanced QA module), and they must all
+behave identically — otherwise a reviewer learns one table's rules and is
+then surprised by the next one.
 
-Table rendering (render_qa_table, qa_table_html, split_pass_fail) is the
-SINGLE shared implementation for every QA results table in the app,
-including the ones app.py renders directly for Content QA / Exact Match
-QA / Styling QA — app.py imports and calls these rather than keeping its
-own separate copy, specifically to avoid two independent implementations
-of the same rendering logic silently drifting apart (exactly what
-happened with the Excel-column-reading logic before it was consolidated
-into one shared function).
+The behaviour every table shares:
+
+  * Fail / Warn / Missing rows are ALWAYS visible, in a full-width table
+    that wraps long text instead of truncating it. These are the only
+    rows anyone actually needs to act on, so they are never hidden behind
+    a click.
+  * Pass / Present rows are collapsed into a closed expander labelled
+    "<pass_label> (n) — click to view". They are still one click away,
+    but a run where everything passed shows a short confirmation instead
+    of two hundred green rows.
+  * An "Expand" button opens the COMPLETE table (passes included) in a
+    modal dialog with its own close button, for when someone does want to
+    read the whole thing without scrolling the page.
+
+Rendering uses plain HTML tables rather than st.dataframe because a
+dataframe truncates long detail text to a single clipped line and adds
+its own inner scrollbar — which is exactly wrong for cells that routinely
+contain a full sentence explaining why a check failed. Status colours
+come from the classes defined in theme.py, so the palette lives in one
+place.
 """
 
-import html as html_escape_module
-from typing import List, Tuple
+from __future__ import annotations
+
+import html as _html
+from typing import List, Optional, Sequence
 
 import pandas as pd
 import streamlit as st
 
-from .results import ModuleResult, PASS, FAIL, WARN
+try:
+    from .results import ModuleResult, PASS, FAIL, WARN
+except ImportError:  # pragma: no cover - standalone use
+    from results import ModuleResult, PASS, FAIL, WARN
 
 
-# CSS class names only — the actual colors live in modules/theme.py's
-# --success/--warning/--danger tokens, injected once by theme.inject().
-# Kept here as a lookup so _qa_row_html's logic (branching on status) is
-# unchanged; only what gets emitted (a class instead of an inline hex) is
-# different.
-_STATUS_ROW_CLASS = {
-    "Pass": "qa-row-pass", "Present": "qa-row-pass",
-    "Warn": "qa-row-warn",
-    "Fail": "qa-row-fail", "Missing": "qa-row-fail",
-}
+# Status vocabulary used across the app. "Present" is Content QA's word
+# for a pass; "Missing" is its word for a fail.
+_PASS_WORDS = {"pass", "passed", "present", "ok", "found"}
+_WARN_WORDS = {"warn", "warning"}
+_FAIL_WORDS = {"fail", "failed", "missing", "error"}
 
 
-def _qa_row_html(record: dict, columns: List[str]) -> str:
-    """One <tr> — every cell wraps normally (white-space:normal +
-    word-break:break-word) instead of truncating or forcing a horizontal
-    scrollbar to read, and all text is HTML-escaped since QA detail text
-    can itself contain literal HTML snippets (e.g. quoting an href value)
-    that must render as visible text, not be interpreted as markup.
-
-    The status/severity column is always a single short word (Pass /
-    Fail / Warn / Present / Missing) — it never needs word-break/wrap,
-    and forcing normal wrapping on a column with no min-width let it
-    collapse to a sliver, breaking "Present" onto two lines ("Presen" /
-    "t"). That column gets its own no-wrap, fixed-min-width styling;
-    every other column (Item/Detail/etc., which are genuinely long free
-    text) keeps the original wrapping behaviour unchanged.
-    """
-    status_val = record.get("status") or record.get("severity") or ""
-    row_class = _STATUS_ROW_CLASS.get(str(status_val), "qa-row-none")
-    cells = []
-    for c in columns:
-        is_status_col = c.strip().lower() in ("status", "severity")
-        if is_status_col:
-            cell_style = (
-                "padding:10px 14px;vertical-align:top;"
-                "white-space:nowrap;min-width:100px;width:1%;"
-            )
-        else:
-            cell_style = (
-                "padding:10px 14px;vertical-align:top;"
-                "white-space:normal;word-break:break-word;"
-            )
-        cells.append(
-            f'<td style="{cell_style}">'
-            f'{html_escape_module.escape(str(record.get(c, "")))}</td>'
-        )
-    return f'<tr class="{row_class}">{"".join(cells)}</tr>'
+def _status_class(value: object) -> str:
+    v = str(value or "").strip().lower()
+    if v in _PASS_WORDS:
+        return "pass"
+    if v in _WARN_WORDS:
+        return "warn"
+    if v in _FAIL_WORDS:
+        return "fail"
+    return ""
 
 
-def qa_table_html(records: List[dict], columns: List[str]) -> str:
-    """Full <table> (with header) for a list of QA row dicts. Only ONE
-    scrollbar (overflow-x:auto on the wrapping <div>) rather than the
-    nested "double scroll" produced by st.dataframe's own internal
-    scroll area sitting inside Streamlit's page-level scroll."""
-    if not records:
-        return '<p style="color:var(--text-muted);padding:8px 0;">No rows.</p>'
-    header_cells = "".join(
-        f'<th style="padding:10px 14px;text-align:left;font-weight:600;'
-        f'{"white-space:nowrap;min-width:100px;width:1%;" if c.strip().lower() in ("status", "severity") else ""}">'
-        f'{html_escape_module.escape(c)}</th>'
-        for c in columns
-    )
-    body_rows = "".join(_qa_row_html(r, columns) for r in records)
+def _is_attention(value: object) -> bool:
+    return _status_class(value) in ("warn", "fail")
+
+
+def _cell(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float) and pd.isna(value):
+        return ""
+    text = str(value)
+    if text.strip().lower() == "nan":
+        return ""
+    return _html.escape(text).replace("\n", "<br>")
+
+
+def _table_html(df: pd.DataFrame, status_col: str) -> str:
+    if df is None or not len(df):
+        return ""
+
+    cols = list(df.columns)
+    head = "".join(f"<th>{_html.escape(str(c))}</th>" for c in cols)
+
+    rows_html = []
+    for _, row in df.iterrows():
+        cls = _status_class(row.get(status_col, ""))
+        cells = []
+        for c in cols:
+            val = row.get(c, "")
+            if c == status_col and cls:
+                cells.append(
+                    f'<td><span class="oq-status {cls}">{_cell(val)}</span></td>'
+                )
+            else:
+                cells.append(f"<td>{_cell(val)}</td>")
+        row_cls = f' class="oq-{cls}"' if cls else ""
+        rows_html.append(f"<tr{row_cls}>{''.join(cells)}</tr>")
+
     return (
-        f'<div class="qa-table-wrap" style="overflow-x:auto;max-width:100%;">'
-        f'<table style="width:100%;border-collapse:collapse;font-size:14px;">'
-        f'<thead><tr>{header_cells}</tr></thead>'
-        f'<tbody>{body_rows}</tbody>'
-        f'</table></div>'
+        '<div class="oq-table-wrap"><table class="oq-table">'
+        f"<thead><tr>{head}</tr></thead>"
+        f"<tbody>{''.join(rows_html)}</tbody>"
+        "</table></div>"
     )
 
 
-def split_pass_fail(df: pd.DataFrame, status_col: str) -> Tuple[List[dict], List[dict]]:
-    """Splits a QA DataFrame's rows into (attention_rows, pass_rows) —
-    attention_rows is everything that needs a person's eyes (Fail, Warn,
-    Missing); pass_rows is everything already fine (Pass, Present)."""
-    if df is None or not len(df):
-        return [], []
-    records = df.to_dict("records")
-    pass_like = {"pass", "present"}
-    attention = [r for r in records if str(r.get(status_col, "")).strip().lower() not in pass_like]
-    passing = [r for r in records if str(r.get(status_col, "")).strip().lower() in pass_like]
-    return attention, passing
+def _render_table(df: pd.DataFrame, status_col: str) -> None:
+    html = _table_html(df, status_col)
+    if html:
+        st.markdown(html, unsafe_allow_html=True)
 
 
-@st.dialog("Full QA table", width="large")
-def _show_qa_table_dialog(records: List[dict], columns: List[str]) -> None:
-    """Full-width popup showing every row together. st.dialog renders
-    with its own native close (X) button in the top-right corner and a
-    smooth built-in open/close transition — no custom overlay/JS needed."""
-    st.markdown(qa_table_html(records, columns), unsafe_allow_html=True)
 
+def _disclosure_html(label: str, inner_html: str) -> str:
+    """A native <details>/<summary> dropdown.
 
-def render_qa_table(df: pd.DataFrame, status_col: str, table_key: str, pass_label: str = "Passed") -> None:
+    This was briefly a Streamlit button plus a session-state flag, because
+    st.expander refuses to nest inside the per-email result groups. But a
+    button round-trips to the server and re-runs the whole script just to
+    show rows that were already computed, so every click flashed the
+    "Running..." indicator and rebuilt the page.
+
+    A plain <details> element is opened by the browser itself: instant, no
+    rerun, and no nesting restriction either, since it is ordinary HTML
+    rather than a Streamlit container. The table markup is already
+    generated as a string, so it simply goes inside.
     """
-    Renders one QA results table:
-      - Fail/Warn/Missing rows: always visible, full-width HTML table,
-        cells wrap instead of truncating.
-      - Pass/Present rows: collapsed inside a closed-by-default expander
-        — visible only if the person chooses to open it.
-      - An "Expand" button opens the COMPLETE table (attention + pass
-        rows together) full-width in a popup, with its own native close
-        button.
-    `table_key` must be unique per table on the page.
-    """
+    return (
+        f'<details class="oq-details"><summary>{_html.escape(label)}</summary>'
+        f'<div class="oq-details-body">{inner_html}</div></details>'
+    )
+
+
+def render_qa_table(
+    df: pd.DataFrame,
+    status_col: str,
+    table_key: str,
+    pass_label: str = "Passed",
+) -> None:
+    """The single shared QA table renderer — see the module docstring."""
     if df is None or not len(df):
-        st.info("No checks were run for this table.")
+        st.markdown(
+            '<div class="oq-empty">No checks were produced for this section.</div>',
+            unsafe_allow_html=True,
+        )
         return
 
-    columns = list(df.columns)
-    attention_rows, pass_rows = split_pass_fail(df, status_col)
+    if status_col not in df.columns:
+        _render_table(df, status_col)
+        return
 
-    top = st.columns([0.85, 0.15])
-    with top[1]:
-        expand_clicked = st.button("⤢ Expand", key=f"expand_{table_key}", use_container_width=True)
+    mask = df[status_col].apply(_is_attention)
+    attention_df = df[mask]
+    passed_df = df[~mask]
 
-    if attention_rows:
-        st.markdown(qa_table_html(attention_rows, columns), unsafe_allow_html=True)
-    else:
-        st.success("Nothing needs attention here — every check passed.")
-
-    if pass_rows:
-        with st.expander(f"{pass_label} ({len(pass_rows)}) — click to view", expanded=False):
-            st.markdown(qa_table_html(pass_rows, columns), unsafe_allow_html=True)
+    # "Expand" opens the complete table in a modal.
+    spacer, btn = st.columns([6, 1])
+    with btn:
+        expand_clicked = st.button(
+            "↗ Expand", key=f"{table_key}__expand", use_container_width=True
+        )
 
     if expand_clicked:
-        _show_qa_table_dialog(df.to_dict("records"), columns)
+        st.session_state[f"{table_key}__dialog_open"] = True
+
+    if st.session_state.get(f"{table_key}__dialog_open"):
+        _open_dialog(df, status_col, table_key)
+
+    if len(attention_df):
+        _render_table(attention_df, status_col)
+    else:
+        st.markdown(
+            '<div class="oq-empty">Nothing needs attention here — every check passed.</div>',
+            unsafe_allow_html=True,
+        )
+
+    if len(passed_df):
+        st.markdown(
+            _disclosure_html(
+                f"{pass_label} ({len(passed_df)}) — click to view",
+                _table_html(passed_df, status_col),
+            ),
+            unsafe_allow_html=True,
+        )
 
 
-def render_module_result(result: ModuleResult, show_header: bool = True, table_key: str = "") -> None:
-    if show_header:
-        st.subheader(result.module_name)
-
-    if not result.items and not result.images and not result.notes:
-        st.info("No checks were run for this module (all related inputs were empty/disabled).")
+def _open_dialog(df: pd.DataFrame, status_col: str, table_key: str) -> None:
+    """st.dialog needs a decorated function; it arrived in Streamlit 1.31,
+    which is this app's documented minimum. On anything older the full
+    table is rendered inline instead of in a modal, so the button still
+    does something useful rather than raising."""
+    dialog_fn = getattr(st, "dialog", None)
+    if dialog_fn is None:
+        st.markdown("**Full table**")
+        _render_table(df, status_col)
+        if st.button("Close", key=f"{table_key}__dialog_close_inline"):
+            st.session_state[f"{table_key}__dialog_open"] = False
+            st.rerun()
         return
 
-    if result.items:
+    @dialog_fn("Full QA table", width="large")
+    def _show():
+        _render_table(df, status_col)
+        if st.button("Close", key=f"{table_key}__dialog_close"):
+            st.session_state[f"{table_key}__dialog_open"] = False
+            st.rerun()
+
+    _show()
+
+
+def render_module_result(result: ModuleResult, table_key: str) -> None:
+    """Renders one ModuleResult: heading, Pass/Warn/Fail metrics, its item
+    table, then any notes and images the module attached."""
+    if result is None:
+        return
+
+    st.markdown(f"**{_html.escape(result.module_name)}**")
+
+    items = result.items or []
+    if items:
         p, f, w = result.counts()
         c1, c2, c3 = st.columns(3)
         c1.metric("Passed", p)
         c2.metric("Warnings", w)
         c3.metric("Failed", f)
 
-        df = pd.DataFrame([i.__dict__ for i in result.items])
-        key = table_key or f"module_{result.module_name}"
-        render_qa_table(df, status_col="status", table_key=key, pass_label="Passed")
+        df = pd.DataFrame([{
+            "category": i.category,
+            "rule": i.rule,
+            "status": i.status,
+            "detail": i.detail,
+            "expected": i.expected,
+            "found": i.found,
+        } for i in items])
+        render_qa_table(df, status_col="status", table_key=table_key, pass_label="Passed")
 
-    if result.images:
-        cols = st.columns(min(4, len(result.images)))
-        for i, artifact in enumerate(result.images):
+    for note in (result.notes or []):
+        st.markdown(f'<div class="oq-note">{note}</div>', unsafe_allow_html=True)
+
+    images = result.images or []
+    if images:
+        cols = st.columns(min(len(images), 4))
+        for i, art in enumerate(images):
             with cols[i % len(cols)]:
-                st.image(artifact.png_bytes, caption=artifact.label, use_container_width=True)
+                st.image(art.png_bytes, caption=art.label, use_container_width=True)
 
-    for note in result.notes:
-        if "<span" in note:
-            st.markdown(note, unsafe_allow_html=True)
-        else:
-            st.caption(note)
+    if not items and not result.notes and not images:
+        st.markdown(
+            '<div class="oq-empty">This check did not run — nothing to report.</div>',
+            unsafe_allow_html=True,
+        )
 
 
-def render_summary(results: List[ModuleResult], table_key: str = "advanced_summary") -> None:
-    st.subheader("Summary")
+def render_summary(results: Sequence[ModuleResult], table_key: str) -> None:
+    """One row per module: its overall verdict plus Pass/Warn/Fail counts."""
+    results = [r for r in (results or []) if r is not None]
+    if not results:
+        st.markdown(
+            '<div class="oq-empty">No Advanced QA modules produced results for this email.</div>',
+            unsafe_allow_html=True,
+        )
+        return
+
     rows = []
+    tot_p = tot_w = tot_f = 0
     for r in results:
         p, f, w = r.counts()
+        tot_p += p
+        tot_w += w
+        tot_f += f
         rows.append({
-            "Module": r.module_name,
-            "Overall": r.overall_status(),
-            "Passed": p,
-            "Warnings": w,
-            "Failed": f,
+            "module": r.module_name,
+            "status": r.overall_status() if r.items else WARN,
+            "passed": p,
+            "warnings": w,
+            "failed": f,
         })
-    if not rows:
-        st.info("No modules ran for this email.")
-        return
-    df = pd.DataFrame(rows)
-    render_qa_table(df, status_col="Overall", table_key=table_key, pass_label="Passed")
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Passed", tot_p)
+    c2.metric("Warnings", tot_w)
+    c3.metric("Failed", tot_f)
+
+    render_qa_table(
+        pd.DataFrame(rows), status_col="status",
+        table_key=table_key, pass_label="Modules fully passed",
+    )

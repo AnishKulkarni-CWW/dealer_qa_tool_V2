@@ -57,6 +57,48 @@ Backward compatibility: `run_banner_text_qa` still accepts a plain OCR
 string via `ocr_text` for the Dealer Name check and as a fallback if no
 clustered data is supplied (old call sites keep working, just without
 the headline/subheadline/dealer-name band separation).
+
+--------------------------------------------------------------------------
+Content-first field matching (font-size banding demoted to a fallback)
+--------------------------------------------------------------------------
+Font-size banding still could not separate two lines OCR'd at the same
+size. Real, measured case: a banner reading
+
+    ENGINEERED TO DELIVER OPTIMAL      (23px)
+    PERFORMANCE EVERY DAY.             (23px)
+    BMW FUEL ADDITIVES.                (17px)
+    Infinity Cars                      (22px)   <- dealer name
+
+puts the dealer name 4% away from the headline lines — well inside the
+jitter tolerance that has to exist to absorb OCR measurement noise — so
+geometry merges the dealer name into the Headline band. The expected
+Headline OCR'd from the Master then reads "ENGINEERED TO DELIVER OPTIMAL
+PERFORMANCE EVERY DAY. Infinity Cars", and every dealer's email is failed
+for missing words it was never supposed to contain.
+
+So this module now assigns lines to fields by CONTENT first (see
+`ocr_engine.assign_lines_by_content`), using the font-size bands only as a
+per-field fallback when content assignment finds nothing, and the flat
+whole-banner blob as a final fallback after that. Content assignment is
+deliberately conservative — a line must have most of its own words in a
+field's expected text to be assigned to it — so genuinely wrong banner
+copy is never absorbed into a field to make it pass; it stays unmatched
+and is reported in the notes.
+
+--------------------------------------------------------------------------
+`known_dealer_names` — the Master may carry a DIFFERENT dealer
+--------------------------------------------------------------------------
+The expected Headline/Subheadline are OCR'd from the Master creative, and
+one Master is routinely reused across every dealer version of a campaign
+(only the dealer line changes). So the Master's own dealer name — another
+dealer entirely — is what leaks into the expected copy above. Stripping
+only THIS email's dealer name cannot remove it.
+
+Callers can now pass `known_dealer_names` (every dealer in the Excel
+sheet); a trailing name belonging to ANY of them is stripped from the
+expected Headline/Subheadline before comparison. Only ever at the end of
+the string, and only a name that is genuinely on that list, so real
+banner copy is never touched.
 """
 
 import re
@@ -96,10 +138,34 @@ def diff_words(expected: str, found: str, match_case: bool = False) -> WordDiff:
     return WordDiff(missing=missing, extra=extra)
 
 
-def _field_status(expected: str, found: str, config, match_case: bool = False) -> tuple:
+def _squash(text: str, match_case: bool = False) -> str:
+    """Letters and digits only, all spacing removed."""
+    t = text if match_case else text.lower()
+    return re.sub(r"[^0-9A-Za-z]", "", t)
+
+
+def _field_status(expected: str, found: str, config, match_case: bool = False,
+                  space_insensitive: bool = False) -> tuple:
     if not expected.strip():
         return WARN, "No expected value provided for this field — skipped."
     wd = diff_words(expected, found, match_case=match_case)
+
+    # `space_insensitive` is OFF by default, so the comparison is exactly
+    # as strict as it has always been. It is switched on by app.py for one
+    # specific case only: when the RapidOCR fallback engine is in use.
+    # That engine merges words on tightly-tracked display type - it reads
+    # "Bavaria Motors" as "BavariaMotors" - which would otherwise report
+    # every word of a perfectly correct banner as missing. Tesseract and
+    # PaddleOCR space words correctly, so they never take this path and a
+    # genuine spacing defect in the artwork is still caught by them.
+    if space_insensitive and wd.missing:
+        squashed_found = _squash(found, match_case=match_case)
+        if squashed_found:
+            wd = WordDiff(
+                missing=[w for w in wd.missing
+                         if _squash(w, match_case=match_case) not in squashed_found],
+                extra=wd.extra,
+            )
     exp_tokens = _tokenize(expected, match_case=match_case)
     if not exp_tokens:
         return WARN, "Expected value has no comparable words."
@@ -137,8 +203,41 @@ def _strip_trailing_dealer_name(expected_text: str, dealer_name: str) -> str:
     pattern = re.escape(name).replace(r"\ ", r"\s+")
     # Match the dealer name at the end of the string, allowing trailing
     # punctuation/whitespace after it (e.g. "...ADDITIVES. Bavaria Motors").
-    stripped = re.sub(rf"\s*{pattern}\s*[.,]?\s*$", "", text, flags=re.IGNORECASE)
+    # A brand prefix immediately before the name is stripped too, since
+    # banners routinely render "BMW Bird Automotive" for a dealer the Excel
+    # sheet calls "Bird Automotive".
+    stripped = re.sub(rf"\s*(?:BMW\s+)?{pattern}\s*[.,]?\s*$", "", text, flags=re.IGNORECASE)
     return stripped.strip()
+
+
+def _strip_any_dealer_name(expected_text: str, dealer_names) -> str:
+    """
+    Strips a trailing dealer name belonging to ANY known dealer, not just
+    the one this email is for.
+
+    This exists because the expected Headline / Subheadline are OCR'd from
+    the MASTER creative, and the master frequently carries a DIFFERENT
+    dealer than the email under test — a master built for "Bavaria Motors"
+    is routinely used to QA an "Infinity Cars" mailer. Without this, the
+    master's own dealer line gets swept into the expected Subheadline
+    ("BMW FUEL ADDITIVES. Bavaria Motors") and the email under test is
+    then failed for not containing another dealer's name, which it could
+    never contain and should never contain.
+
+    Only ever strips at the very END of the string and only a name that is
+    genuinely on the caller-supplied known-dealer list, so real copy is
+    never touched. Longest names are tried first so "Krishna Automobiles"
+    is not half-stripped by "Krishna Automotive".
+    """
+    text = expected_text or ""
+    if not text.strip() or not dealer_names:
+        return text
+    for name in sorted({str(n or "").strip() for n in dealer_names if str(n or "").strip()},
+                       key=len, reverse=True):
+        stripped = _strip_trailing_dealer_name(text, name)
+        if stripped != text:
+            return stripped
+    return text
 
 
 def run_banner_text_qa(
@@ -149,6 +248,8 @@ def run_banner_text_qa(
     config=DEFAULT_CONFIG,
     clustered_lines: Optional[object] = None,  # ocr_engine.ClusteredLines, kept optional for back-compat
     match_case: bool = True,  # Case-sensitive comparison is always on ("BMW" != "bmw")
+    space_insensitive: bool = False,  # only set when the RapidOCR fallback engine is active
+    known_dealer_names: Optional[List[str]] = None,  # every dealer in the Excel sheet, if available
 ) -> ModuleResult:
     result = ModuleResult(module_name="Banner Text QA")
 
@@ -163,79 +264,126 @@ def run_banner_text_qa(
         expected_subheadline = _strip_trailing_dealer_name(expected_subheadline, expected_dealer_name)
         expected_headline = _strip_trailing_dealer_name(expected_headline, expected_dealer_name)
 
+    # ...and neither should ANOTHER dealer's name, which is what leaks in
+    # when the Master creative was built for a different dealer than the
+    # email under test (see _strip_any_dealer_name). Runs second so the
+    # email's own dealer name is always stripped first.
+    if known_dealer_names:
+        _sub_before, _head_before = expected_subheadline, expected_headline
+        expected_subheadline = _strip_any_dealer_name(expected_subheadline, known_dealer_names)
+        expected_headline = _strip_any_dealer_name(expected_headline, known_dealer_names)
+        if expected_subheadline != _sub_before or expected_headline != _head_before:
+            result.notes.append(
+                "A different dealer's name was found trailing the expected Headline/Subheadline "
+                "(the Master creative carries another dealer than this email) and was removed "
+                "before comparison — Dealer Name is checked on its own row instead."
+            )
+
+    headline_found = ""
+    subheadline_found = ""
+    dealer_found = ""
+    match_method_note = ""
+
     if clustered_lines is not None:
-        headline_lines = list(clustered_lines.headline_lines)
-        subheadline_lines = list(clustered_lines.subheadline_lines)
-        other_lines = list(clustered_lines.other_lines)
+        headline_lines = list(getattr(clustered_lines, "headline_lines", None) or [])
+        subheadline_lines = list(getattr(clustered_lines, "subheadline_lines", None) or [])
+        other_lines = list(getattr(clustered_lines, "other_lines", None) or [])
+        pre_matched_dealer = getattr(clustered_lines, "dealer_line", None)
 
-        # Content-aware Dealer Name line search: look across ALL bands'
-        # raw lines (not just whichever band geometry happened to place
-        # it in) for the one line whose words actually match the
-        # expected dealer name. This is the authoritative source for
-        # `dealer_found` whenever it succeeds — far more reliable than a
-        # positional "last line of Subheadline" guess, since it only
-        # ever matches a line that genuinely contains the dealer name's
-        # words, in either direction (see find_dealer_line() docstring
-        # in ocr_engine.py for the full rationale).
-        dealer_match_line = None
-        if expected_dealer_name.strip():
-            all_band_lines = (
-                (getattr(clustered_lines, "headline_lines", None) or [])
-                + (getattr(clustered_lines, "subheadline_lines", None) or [])
-                + (getattr(clustered_lines, "other_lines", None) or [])
-            )
-            # A caller that already ran extract_clustered_text() WITH
-            # expected_dealer_name will have this pre-populated — reuse
-            # it directly rather than re-searching. Otherwise (e.g. an
-            # older clustering built without the dealer name known yet)
-            # search now, across every line we can see.
-            pre_matched = getattr(clustered_lines, "dealer_line", None)
-            dealer_match_line = pre_matched or _ocr_engine.find_dealer_line(
-                all_band_lines, expected_dealer_name
-            )
+        all_band_lines = list(headline_lines) + list(subheadline_lines) + list(other_lines)
+        if pre_matched_dealer is not None and pre_matched_dealer not in all_band_lines:
+            all_band_lines.append(pre_matched_dealer)
+        all_band_lines.sort(key=lambda l: getattr(l, "top", 0))
 
-        if dealer_match_line is not None:
-            # Remove the matched line from whichever band it's still
-            # sitting in (by identity, so a repeated line of the same
-            # text elsewhere on the banner isn't also stripped out) so
-            # it never also pollutes Headline/Subheadline's own text.
-            headline_lines = [l for l in headline_lines if l is not dealer_match_line]
-            subheadline_lines = [l for l in subheadline_lines if l is not dealer_match_line]
-            other_lines = [l for l in other_lines if l is not dealer_match_line]
-            dealer_found = dealer_match_line.text
-        else:
-            # No confident content match — fall back to whatever
-            # geometric band(s) the OCR engine assigned as "smaller than
-            # Subheadline", same as the original behaviour. If there
-            # isn't one, `dealer_found` stays empty here and is picked
-            # up by the single-band whole-blob fallback further below.
-            dealer_found = " ".join(l.text for l in other_lines)
+        # -----------------------------------------------------------------
+        # PRIMARY: content-aware assignment.
+        #
+        # Each OCR'd line is attributed to Headline / Subheadline / Dealer
+        # Name by what it actually says. This replaces font-size banding as
+        # the primary mechanism because banding demonstrably cannot separate
+        # lines of the same measured size — a dealer name set at 22px under
+        # a 23px headline line is inside any workable jitter tolerance, so
+        # geometry put the dealer name in the Headline band and failed a
+        # banner that was completely correct. See
+        # ocr_engine.assign_lines_by_content() for the full rationale.
+        #
+        # It is not allowed to weaken the QA: a line only matches a field
+        # when most of the line's own words belong to that field's expected
+        # text, so genuinely wrong copy stays unmatched and is reported.
+        # -----------------------------------------------------------------
+        assignment = _ocr_engine.assign_lines_by_content(
+            all_band_lines,
+            expected_headline=expected_headline,
+            expected_subheadline=expected_subheadline,
+            expected_dealer_name=expected_dealer_name,
+        )
 
-        headline_found = " ".join(l.text for l in headline_lines)
-        subheadline_found = " ".join(l.text for l in subheadline_lines)
+        headline_found = assignment.headline_text
+        subheadline_found = assignment.subheadline_text
+        dealer_found = assignment.dealer_text
 
-        # If OCR only detected a single font band (e.g. banner really only
-        # has one line of text), fall back to the whole blob for whichever
-        # expected field didn't get its own band, rather than reporting a
-        # false "Missing word(s)" for every word.
+        # -----------------------------------------------------------------
+        # FALLBACK 1: the original font-size bands, used per-field and only
+        # where content assignment found nothing. This is what keeps a
+        # genuinely wrong banner reporting a real Fail with the real text
+        # that IS on it, rather than an empty "found" column.
+        # -----------------------------------------------------------------
+        used_band_fallback = []
+        if expected_headline.strip() and not headline_found.strip():
+            headline_found = " ".join(l.text for l in headline_lines
+                                      if l is not assignment.dealer_line)
+            if headline_found.strip():
+                used_band_fallback.append("Headline")
+        if expected_subheadline.strip() and not subheadline_found.strip():
+            subheadline_found = " ".join(l.text for l in subheadline_lines
+                                         if l is not assignment.dealer_line)
+            if subheadline_found.strip():
+                used_band_fallback.append("Subheadline")
+        if expected_dealer_name.strip() and not dealer_found.strip():
+            if pre_matched_dealer is not None:
+                dealer_found = pre_matched_dealer.text
+            else:
+                dealer_found = " ".join(l.text for l in other_lines)
+            if dealer_found.strip():
+                used_band_fallback.append("Dealer Name")
+
+        # -----------------------------------------------------------------
+        # FALLBACK 2 (unchanged): whole-blob comparison for any field that
+        # still has nothing, e.g. a banner with a single font size only.
+        # -----------------------------------------------------------------
+        used_blob_fallback = []
         if expected_headline.strip() and not headline_found.strip():
             headline_found = ocr_text
+            used_blob_fallback.append("Headline")
         if expected_subheadline.strip() and not subheadline_found.strip():
             subheadline_found = ocr_text
+            used_blob_fallback.append("Subheadline")
         if expected_dealer_name.strip() and not dealer_found.strip():
             dealer_found = ocr_text
+            used_blob_fallback.append("Dealer Name")
 
-        if dealer_match_line is not None:
-            dealer_match_note = "the Dealer Name line was identified by matching its words against the expected dealer name (content-aware match, independent of font-size band)"
-        else:
-            dealer_match_note = f"{len(clustered_lines.other_lines)} dealer-name-band line(s) used (font-size band only — no confident content match found)"
-        note = (
-            f"Headline/Subheadline matched by OCR font-size band "
-            f"(engine detected {len(clustered_lines.headline_lines)} headline-band line(s), "
-            f"{len(clustered_lines.subheadline_lines)} subheadline-band line(s)); "
-            f"{dealer_match_note}."
-        )
-        result.notes.append(note)
+        note_parts = [
+            f"Banner lines matched to fields by content "
+            f"({len(assignment.headline_lines)} headline, "
+            f"{len(assignment.subheadline_lines)} subheadline, "
+            f"{1 if assignment.dealer_line is not None else 0} dealer-name line(s))"
+        ]
+        if used_band_fallback:
+            note_parts.append(
+                "fell back to OCR font-size band for: " + ", ".join(used_band_fallback)
+            )
+        if used_blob_fallback:
+            note_parts.append(
+                "fell back to whole-banner OCR text for: " + ", ".join(used_blob_fallback)
+            )
+        if assignment.unmatched_lines:
+            unmatched_preview = "; ".join(l.text for l in assignment.unmatched_lines[:5])
+            note_parts.append(
+                f"{len(assignment.unmatched_lines)} banner line(s) matched no expected "
+                f"field and were not attributed to one: {unmatched_preview}"
+            )
+        match_method_note = ". ".join(note_parts) + "."
+        result.notes.append(match_method_note)
     else:
         # Back-compat path: no clustered data supplied, compare all three
         # against the full blob as before.
@@ -253,7 +401,8 @@ def run_banner_text_qa(
         result.notes.append("Case-sensitive matching enabled — casing differences (e.g. \"bmw\" vs \"BMW\") count as a mismatch.")
 
     for label, expected, found_text in fields:
-        status, detail = _field_status(expected, found_text, config, match_case=match_case)
+        status, detail = _field_status(expected, found_text, config, match_case=match_case,
+                                       space_insensitive=space_insensitive)
         result.add("Banner Text", label, status, detail=detail, expected=expected, found=found_text[:300])
 
     return result

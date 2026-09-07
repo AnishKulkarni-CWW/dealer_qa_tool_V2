@@ -5,3 +5,16 @@ enableXsrfProtection = false  # needed for large multipart uploads
 
 [browser]
 gatherUsageStats = false
+
+# Streamlit paints its own control fills (selected radio dot, checked
+# checkbox, slider track, focus rings) from these tokens rather than from
+# any stable CSS hook, so the palette has to be declared here as well as
+# in modules/theme.py. primaryColor matches the indigo the theme uses
+# for primary actions, which is what stops the selected radio button
+# rendering in Streamlit's default red.
+[theme]
+base = "light"
+primaryColor = "#4F46E5"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F1F5F9"
+textColor = "#0F172A"

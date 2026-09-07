@@ -38,15 +38,102 @@ left as "other" and is still available via the full joined text.
 compatibility with callers that only need the whole banner text (e.g. the
 OCR QA tab, dealer-in-banner substring check) — nothing about its
 behaviour changed.
+
+--------------------------------------------------------------------------
+Line hygiene: logo/graphic noise must not corrupt a line's font height
+--------------------------------------------------------------------------
+Tesseract groups words into lines using its own block/paragraph/line
+numbering, and it happily puts a NON-TEXT element into a text line when
+the two sit on the same baseline. A real, observed case: a banner with the
+BMW roundel logo immediately to the left of the headline OCR'd as
+
+    'oD) ENGINEERED TO DELIVER OPTIMAL'   (conf 24 on 'oD)')
+
+where the junk 'oD)' token's bounding box was 75px tall against 22-23px
+for the real words. Because the old code took the line's height as
+`max(bottom) - min(top)` across every word in the group, that one junk
+token tripled the measured font height of the headline line — which then
+threw the whole font-size banding off: the headline's two visual lines
+landed in two different bands, and the dealer name got promoted into the
+Subheadline (or even Headline) band. Every downstream comparison then
+failed on a banner that was actually completely correct.
+
+Both problems are fixed at the source in `_lines_with_tesseract()`:
+  1. Words below `MIN_WORD_CONFIDENCE` are dropped (real banner copy OCRs
+     at 80-96; logo/icon debris comes back in the 0-35 range).
+  2. Words whose box height is a wild outlier against the MEDIAN word
+     height of their own line are dropped, so a tall graphic glued onto a
+     line can never define that line's font size.
+Both filters are self-limiting: if applying one would empty a line
+entirely, the line is kept unfiltered, so genuinely low-contrast banner
+copy is never silently discarded. PaddleOCR/RapidOCR return line-level
+boxes with their own confidence scores, so they get the equivalent
+confidence guard.
+
+--------------------------------------------------------------------------
+Content-aware field assignment (`assign_lines_by_content`)
+--------------------------------------------------------------------------
+Font-size banding is a heuristic, and no heuristic survives every banner:
+a dealer name set at 22px directly under a 23px headline line is within
+any sane jitter tolerance, so geometry alone WILL merge them. The same
+reasoning that produced `find_dealer_line()` (match by content, not by
+pixels) applies just as well to Headline and Subheadline: whenever the
+expected values are known — and in this app they always are, since they
+come from the Master JPG/PDF/HTML or Manual Text — each OCR'd line can be
+assigned to whichever field its words actually belong to.
+
+`assign_lines_by_content()` does exactly that, and is deliberately
+conservative: a line is only assigned when a strong majority of its own
+words belong to that field's expected text, so a genuinely WRONG line on
+the banner matches nothing and is reported as unmatched rather than being
+quietly absorbed into a field it doesn't belong to. Callers fall back to
+the geometric bands whenever content assignment finds nothing for a field,
+so behaviour is never worse than before.
 """
 
 import re
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import List, Optional, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 from PIL import Image
+
+
+# --------------------------------------------------------------------------
+# Line-hygiene tuning knobs (see the "Line hygiene" section of the module
+# docstring). Every one of these is a single place to tune — nothing below
+# hardcodes a threshold.
+# --------------------------------------------------------------------------
+
+# Word/line detections below this OCR confidence are treated as graphic
+# debris (logo edges, icons, number plates blurring into the artwork) and
+# dropped. Real banner copy comes back at 80+; the observed BMW-roundel
+# artefact came back at 24.
+MIN_WORD_CONFIDENCE = 35.0
+
+# A word whose bounding box is more than this multiple of its own line's
+# MEDIAN word height is not part of that line's text — it is a graphic that
+# happens to share the baseline. (The observed case: a 75px logo box glued
+# onto a line of 22px words.)
+MAX_WORD_HEIGHT_RATIO = 1.8
+
+# ...and the same guard in the other direction, for subscript-sized debris.
+MIN_WORD_HEIGHT_RATIO = 0.40
+
+# Content-assignment threshold: the fraction of a candidate LINE's own words
+# that must belong to a field's expected text before that line is assigned
+# to the field. Deliberately high enough that an unrelated line is left
+# unmatched (and therefore still reported) rather than absorbed.
+FIELD_MATCH_MIN_LINE_RATIO = 0.6
+
+# When matching a dealer-name line, this many words on the line may be
+# absent from the expected dealer name and the line still counts as a
+# match. Exists because banners routinely brand-prefix the dealer name —
+# the Excel column says "Bird Automotive" while the artwork reads "BMW Bird
+# Automotive", which is a 0.67 word-overlap and used to be rejected outright
+# by the old symmetric 0.7 threshold.
+DEALER_LINE_MAX_EXTRA_TOKENS = 2
 
 
 @dataclass
@@ -87,6 +174,16 @@ class ClusteredLines:
     # much stronger signal than "whatever fell into the smallest font band" —
     # callers should prefer this field when it is non-empty.
     dealer_line: Optional["TextLine"] = None
+    # Which of the supplied candidate dealer names `dealer_line` actually
+    # matched. Callers that pass a LIST of candidates (e.g. every dealer in
+    # the Excel sheet, because the Master creative may carry a different
+    # dealer than the email under test) need to know which one was found so
+    # they can strip it out of the master-derived Headline/Subheadline.
+    dealer_name_matched: str = ""
+    # Lines that content assignment could not attribute to any expected
+    # field. Never used for pass/fail on their own — surfaced as a note so
+    # unexpected banner copy is visible rather than silently dropped.
+    unmatched_lines: List["TextLine"] = field(default_factory=list)
 
     @property
     def headline_text(self) -> str:
@@ -127,9 +224,88 @@ def _dealer_name_tokens(text: str) -> set:
     return set(re.findall(r"[A-Za-z0-9]+", (text or "").lower()))
 
 
+def _as_name_list(expected_dealer_name: Union[str, Sequence[str], None]) -> List[str]:
+    """
+    Normalises the `expected_dealer_name` argument, which is now allowed to
+    be either a single name (as before) or a sequence of candidate names.
+
+    A LIST matters for the Master banner: the Master creative frequently
+    carries a DIFFERENT dealer than the email under test (a generic master
+    built for "Bavaria Motors" is used to QA an "Infinity Cars" mailer).
+    Passing every dealer name from the Excel sheet lets the master's own
+    dealer line be located and lifted out of the master-derived Headline /
+    Subheadline, instead of leaking into them as expected copy that the
+    email under test could never possibly contain.
+    """
+    if not expected_dealer_name:
+        return []
+    if isinstance(expected_dealer_name, str):
+        name = expected_dealer_name.strip()
+        return [name] if name else []
+    out = []
+    seen = set()
+    for n in expected_dealer_name:
+        name = str(n or "").strip()
+        if name and name.casefold() not in seen:
+            seen.add(name.casefold())
+            out.append(name)
+    return out
+
+
+def find_dealer_line_with_name(
+    lines: List[TextLine],
+    expected_dealer_name: Union[str, Sequence[str], None],
+    min_ratio: float = 0.7,
+    max_extra_line_tokens: int = DEALER_LINE_MAX_EXTRA_TOKENS,
+) -> Tuple[Optional[TextLine], str]:
+    """
+    Same as `find_dealer_line()` but also returns WHICH candidate name was
+    matched (empty string when nothing matched). See that function's
+    docstring for the full rationale.
+    """
+    candidates = _as_name_list(expected_dealer_name)
+    if not candidates or not lines:
+        return None, ""
+
+    best_line = None
+    best_name = ""
+    best_score = 0.0
+    for name in candidates:
+        d_tokens = _dealer_name_tokens(name)
+        if not d_tokens:
+            continue
+        for line in lines:
+            l_tokens = _dealer_name_tokens(line.text)
+            if not l_tokens:
+                continue
+            overlap = d_tokens & l_tokens
+            if not overlap:
+                continue
+            ratio_of_expected = len(overlap) / len(d_tokens)
+            ratio_of_line = len(overlap) / len(l_tokens)
+            extra_on_line = len(l_tokens - d_tokens)
+            # The expected-name direction stays strict: most of the dealer
+            # name's own words must be on the line, so an unrelated line
+            # never matches. The line direction is relaxed by a small
+            # absolute allowance so a brand-prefixed rendering ("BMW Bird
+            # Automotive" for "Bird Automotive") still matches — that is 2
+            # of 3 words = 0.67, which the old symmetric ratio rejected.
+            line_ok = (ratio_of_line >= min_ratio) or (extra_on_line <= max_extra_line_tokens)
+            if ratio_of_expected >= min_ratio and line_ok:
+                # Tie-break toward the match with the most shared words, so a
+                # longer, more specific dealer name beats a shorter one that
+                # happens to be a prefix of it.
+                score = ratio_of_expected + ratio_of_line + (0.01 * len(overlap))
+                if score > best_score:
+                    best_score = score
+                    best_line = line
+                    best_name = name
+    return best_line, best_name
+
+
 def find_dealer_line(
     lines: List[TextLine],
-    expected_dealer_name: str,
+    expected_dealer_name: Union[str, Sequence[str], None],
     min_ratio: float = 0.7,
 ) -> Optional[TextLine]:
     """
@@ -184,28 +360,107 @@ def find_dealer_line(
     line (highest combined overlap ratio) is returned — real banners
     have at most one dealer-name line, so ties are broken toward the
     strongest match rather than the first/last positionally.
-    """
-    d_tokens = _dealer_name_tokens(expected_dealer_name)
-    if not d_tokens or not lines:
-        return None
 
-    best_line = None
-    best_score = 0.0
+    `expected_dealer_name` may be a single name or a sequence of candidate
+    names (see `_as_name_list()`); use `find_dealer_line_with_name()` when
+    you also need to know which candidate matched.
+    """
+    line, _name = find_dealer_line_with_name(lines, expected_dealer_name, min_ratio=min_ratio)
+    return line
+
+
+@dataclass
+class FieldAssignment:
+    """Result of `assign_lines_by_content()`."""
+    headline_lines: List[TextLine] = field(default_factory=list)
+    subheadline_lines: List[TextLine] = field(default_factory=list)
+    dealer_line: Optional[TextLine] = None
+    dealer_name_matched: str = ""
+    unmatched_lines: List[TextLine] = field(default_factory=list)
+
+    @property
+    def headline_text(self) -> str:
+        return " ".join(l.text for l in self.headline_lines)
+
+    @property
+    def subheadline_text(self) -> str:
+        return " ".join(l.text for l in self.subheadline_lines)
+
+    @property
+    def dealer_text(self) -> str:
+        return self.dealer_line.text if self.dealer_line is not None else ""
+
+
+def assign_lines_by_content(
+    lines: List[TextLine],
+    expected_headline: str = "",
+    expected_subheadline: str = "",
+    expected_dealer_name: Union[str, Sequence[str], None] = None,
+    min_line_ratio: float = FIELD_MATCH_MIN_LINE_RATIO,
+) -> FieldAssignment:
+    """
+    Assigns each OCR'd line to Headline / Subheadline / Dealer Name by what
+    the line actually SAYS, rather than by how tall it was measured.
+
+    Why this is needed on top of `cluster_lines_by_size()`: font-size
+    banding cannot separate lines that are genuinely the same measured
+    size. A real, observed banner renders
+
+        ENGINEERED TO DELIVER OPTIMAL      (23px)
+        PERFORMANCE EVERY DAY.             (23px)
+        BMW FUEL ADDITIVES.                (17px)
+        Infinity Cars                      (22px)   <- dealer name
+
+    where the dealer name at 22px is within 5% of the 23px headline lines —
+    inside any jitter tolerance that also has to absorb genuine OCR
+    measurement noise. Geometry therefore puts the dealer name in the
+    Headline band, and both Headline and Subheadline then fail on a banner
+    that is completely correct. Because this app always knows what the
+    fields are supposed to contain (Master JPG/PDF/HTML or Manual Text),
+    matching on content sidesteps the measurement problem entirely.
+
+    Deliberately conservative, so QA stays honest:
+      - A line is assigned only when at least `min_line_ratio` of the
+        LINE's own words appear in that field's expected text. A line whose
+        copy is genuinely wrong therefore matches nothing, lands in
+        `unmatched_lines`, and is reported — never silently absorbed into a
+        field so that the field appears to pass.
+      - Each line goes to its single best-scoring field, so a word shared
+        between two expected values (e.g. "BMW" appearing in both) cannot
+        drag a line into the wrong field.
+      - Dealer name is resolved first and bidirectionally (via
+        `find_dealer_line_with_name()`), since it is the strongest signal.
+    """
+    assignment = FieldAssignment()
+    if not lines:
+        return assignment
+
+    dealer_line, dealer_name = find_dealer_line_with_name(lines, expected_dealer_name)
+    assignment.dealer_line = dealer_line
+    assignment.dealer_name_matched = dealer_name
+
+    h_tokens = _dealer_name_tokens(expected_headline)
+    s_tokens = _dealer_name_tokens(expected_subheadline)
+
     for line in lines:
+        if line is dealer_line:
+            continue
         l_tokens = _dealer_name_tokens(line.text)
         if not l_tokens:
             continue
-        overlap = d_tokens & l_tokens
-        if not overlap:
-            continue
-        ratio_of_expected = len(overlap) / len(d_tokens)
-        ratio_of_line = len(overlap) / len(l_tokens)
-        if ratio_of_expected >= min_ratio and ratio_of_line >= min_ratio:
-            score = ratio_of_expected + ratio_of_line
-            if score > best_score:
-                best_score = score
-                best_line = line
-    return best_line
+        h_ratio = len(l_tokens & h_tokens) / len(l_tokens) if h_tokens else 0.0
+        s_ratio = len(l_tokens & s_tokens) / len(l_tokens) if s_tokens else 0.0
+        if h_ratio >= min_line_ratio and h_ratio >= s_ratio:
+            assignment.headline_lines.append(line)
+        elif s_ratio >= min_line_ratio:
+            assignment.subheadline_lines.append(line)
+        else:
+            assignment.unmatched_lines.append(line)
+
+    assignment.headline_lines.sort(key=lambda l: l.top)
+    assignment.subheadline_lines.sort(key=lambda l: l.top)
+    assignment.unmatched_lines.sort(key=lambda l: l.top)
+    return assignment
 
 
 def _try_load_paddleocr():
@@ -266,6 +521,15 @@ def _lines_with_paddle(reader, image: Image.Image) -> List[TextLine]:
                     # the same rationale.
                     if not re.search(r"[A-Za-z0-9]", text):
                         continue
+                    # Drop low-confidence detections: a logo/icon read as
+                    # text carries a huge bounding box that would otherwise
+                    # define a bogus font-size band. PaddleOCR scores are
+                    # 0.0-1.0, MIN_WORD_CONFIDENCE is a 0-100 percentage.
+                    try:
+                        if float(det[1][1]) * 100.0 < MIN_WORD_CONFIDENCE:
+                            continue
+                    except (TypeError, ValueError, IndexError):
+                        pass
                     height, top, center_y = _box_height_and_center(box)
                     lines.append(TextLine(text=text.strip(), height=height, top=top, center_y=center_y))
                 except Exception:
@@ -309,6 +573,59 @@ def _configure_tesseract_path_if_needed(pytesseract_module) -> None:
                 return
 
 
+def _median(values: List[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return float(ordered[mid])
+    return (float(ordered[mid - 1]) + float(ordered[mid])) / 2.0
+
+
+def _filter_line_words(words: List[dict]) -> List[dict]:
+    """
+    Removes graphic debris from one Tesseract line group before its font
+    height is measured. See the "Line hygiene" section of the module
+    docstring for the case this exists for (a BMW roundel logo OCR'ing as
+    'oD)' at confidence 24 with a 75px box, glued onto a line of 22px
+    headline words, tripling that line's measured font height and wrecking
+    the font-size banding for the whole banner).
+
+    Two independent passes, each of which REFUSES to empty the line:
+      1. confidence — drop anything below MIN_WORD_CONFIDENCE
+      2. height outliers — drop anything whose box height is far from the
+         median height of the (surviving) words on this line
+    The "never empty the line" rule is what keeps this safe: genuinely
+    hard-to-read banner copy (light text over a photo) may OCR at low
+    confidence across the whole line, and dropping it would turn a
+    readable line into a missing one. In that case the line is kept exactly
+    as it was, and behaviour is identical to before this filter existed.
+    """
+    if not words:
+        return words
+
+    confident = []
+    for w in words:
+        try:
+            if float(w["conf"]) >= MIN_WORD_CONFIDENCE:
+                confident.append(w)
+        except (TypeError, ValueError):
+            confident.append(w)
+    kept = confident if confident else list(words)
+
+    heights = [float(w["height"]) for w in kept if float(w["height"]) > 0]
+    med = _median(heights)
+    if med <= 0:
+        return kept
+
+    in_range = [
+        w for w in kept
+        if MIN_WORD_HEIGHT_RATIO * med <= float(w["height"]) <= MAX_WORD_HEIGHT_RATIO * med
+    ]
+    return in_range if in_range else kept
+
+
 def _lines_with_tesseract(image: Image.Image) -> List[TextLine]:
     import pytesseract
     _configure_tesseract_path_if_needed(pytesseract)
@@ -317,9 +634,11 @@ def _lines_with_tesseract(image: Image.Image) -> List[TextLine]:
     data = pytesseract.image_to_data(rgb, output_type=pytesseract.Output.DICT)
 
     # Group word-level boxes into lines using tesseract's own
-    # block/par/line numbering, then merge word text + take the max word
-    # height in that line as the line's font height (more robust than
-    # averaging, since a single tall character can otherwise get diluted).
+    # block/par/line numbering. Word boxes are kept individually at this
+    # stage (rather than being collapsed into a running min-top/max-bottom
+    # immediately, as the old code did) precisely so that _filter_line_words
+    # can drop debris BEFORE the line's font height is measured — once the
+    # boxes are merged, a junk box is indistinguishable from a tall letter.
     line_groups = {}
     n = len(data.get("text", []))
     for i in range(n):
@@ -338,17 +657,19 @@ def _lines_with_tesseract(image: Image.Image) -> List[TextLine]:
         if not re.search(r"[A-Za-z0-9]", word):
             continue
         key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
-        top = data["top"][i]
-        height = data["height"][i]
-        line_groups.setdefault(key, {"words": [], "top": top, "bottom": top + height})
-        g = line_groups[key]
-        g["words"].append(word)
-        g["top"] = min(g["top"], top)
-        g["bottom"] = max(g["bottom"], top + height)
+        line_groups.setdefault(key, []).append({
+            "text": word,
+            "top": float(data["top"][i]),
+            "height": float(data["height"][i]),
+            "left": float(data["left"][i]),
+            "conf": conf,
+        })
 
     lines: List[TextLine] = []
-    for g in line_groups.values():
-        text = " ".join(g["words"]).strip()
+    for words in line_groups.values():
+        kept = _filter_line_words(words)
+        kept = sorted(kept, key=lambda w: w["left"])
+        text = " ".join(w["text"] for w in kept).strip()
         if not text:
             continue
         # Drop lines that are pure punctuation/symbol noise (e.g. a stray
@@ -357,8 +678,8 @@ def _lines_with_tesseract(image: Image.Image) -> List[TextLine]:
         # of whatever real headline text follows, corrupting the match.
         if not re.search(r"[A-Za-z0-9]", text):
             continue
-        top = float(g["top"])
-        bottom = float(g["bottom"])
+        top = min(w["top"] for w in kept)
+        bottom = max(w["top"] + w["height"] for w in kept)
         height = max(bottom - top, 1.0)
         center_y = (top + bottom) / 2.0
         lines.append(TextLine(text=text, height=height, top=top, center_y=center_y))
@@ -371,6 +692,114 @@ def _ocr_with_tesseract(image: Image.Image) -> str:
     import pytesseract
     _configure_tesseract_path_if_needed(pytesseract)
     return pytesseract.image_to_string(image.convert("RGB"))
+
+
+
+# --------------------------------------------------------------------------
+# RapidOCR — a last-resort engine that needs nothing outside pip
+# --------------------------------------------------------------------------
+# `pip install pytesseract` only installs a WRAPPER; Tesseract itself is a
+# system binary that has to be installed separately. On a machine where
+# nobody ran that installer, and where PaddleOCR is also absent, every OCR
+# call raised and both extract_text() and extract_lines() returned nothing
+# at all. Because the banner headline exists only as pixels, that meant
+# Headline / Subheadline / Dealer Name came back empty and Banner Text QA
+# silently reported "No expected value provided for this field" - the
+# user could not tell a blank banner apart from a missing OCR engine.
+#
+# RapidOCR ships its ONNX models inside the wheel and runs on onnxruntime,
+# so `pip install rapidocr-onnxruntime` is genuinely all that is needed:
+# no admin rights, no system package, no model download.
+#
+# IMPORTANT - this is ONLY an engine. It is reached exclusively when both
+# PaddleOCR and Tesseract have already failed, i.e. on the exact code path
+# that previously produced an empty result. The line clustering
+# (cluster_lines_by_size / extract_clustered_text) is untouched, so on any
+# machine where Tesseract works, behaviour is bit-for-bit what it was.
+#
+# Caveat worth knowing: RapidOCR tends to merge words on tightly-tracked
+# display type ("BavariaMotors" for "Bavaria Motors"), which Tesseract
+# handles correctly. Callers can detect this via `engine_used` and relax
+# their word comparison accordingly. Tesseract remains the recommended
+# engine and is preferred whenever it is present.
+
+_RAPID_READER = None
+_RAPID_TRIED = False
+
+
+def _try_load_rapidocr():
+    global _RAPID_READER, _RAPID_TRIED
+    if _RAPID_TRIED:
+        return _RAPID_READER
+    _RAPID_TRIED = True
+    try:
+        from rapidocr_onnxruntime import RapidOCR  # type: ignore
+        _RAPID_READER = RapidOCR()
+    except Exception:
+        _RAPID_READER = None
+    return _RAPID_READER
+
+
+def _lines_with_rapidocr(reader, image: Image.Image) -> List[TextLine]:
+    """RapidOCR returns a flat [[box, text, score], ...]; the box is the
+    same four-point polygon PaddleOCR uses, so the downstream font-height
+    clustering sees exactly the same shape of data."""
+    arr = np.array(image.convert("RGB"))
+    result, _elapse = reader(arr)
+    lines: List[TextLine] = []
+    for det in (result or []):
+        try:
+            box, text = det[0], det[1]
+            if not text or not text.strip():
+                continue
+            if not re.search(r"[A-Za-z0-9]", text):
+                continue
+            # Same confidence guard as the Paddle path: RapidOCR's score is
+            # det[2], 0.0-1.0. Keeps logo/icon debris from defining a band.
+            try:
+                if float(det[2]) * 100.0 < MIN_WORD_CONFIDENCE:
+                    continue
+            except (TypeError, ValueError, IndexError):
+                pass
+            height, top, center_y = _box_height_and_center(box)
+            lines.append(TextLine(text=text.strip(), height=height, top=top, center_y=center_y))
+        except Exception:
+            continue
+    lines.sort(key=lambda l: l.top)
+    return lines
+
+
+def _ocr_with_rapidocr(reader, image: Image.Image) -> str:
+    return "\n".join(l.text for l in _lines_with_rapidocr(reader, image))
+
+
+def ocr_status() -> Tuple[bool, str, str]:
+    """(available, engine_name, human_readable_message).
+
+    Lets the UI say "no OCR engine is installed" outright instead of
+    leaving the user staring at empty expected values with no explanation.
+    """
+    if _try_load_paddleocr() is not None:
+        return True, "paddleocr", "PaddleOCR is active."
+    try:
+        import pytesseract
+        _configure_tesseract_path_if_needed(pytesseract)
+        pytesseract.get_tesseract_version()
+        return True, "tesseract", "Tesseract is active."
+    except Exception:
+        pass
+    if _try_load_rapidocr() is not None:
+        return True, "rapidocr", (
+            "Tesseract is not installed, so the bundled RapidOCR fallback is being used. "
+            "It reads the banner but tends to run words together, so install Tesseract "
+            "for accurate word spacing."
+        )
+    return False, "none", (
+        "No OCR engine is available, so Headline, Subheadline and Dealer Name cannot be "
+        "read from the banner and will show as empty. Install Tesseract from "
+        "https://github.com/UB-Mannheim/tesseract/wiki (the app finds the default install "
+        "location automatically), or run: pip install rapidocr-onnxruntime"
+    )
 
 
 def extract_text(image: Image.Image, prefer: str = "paddleocr") -> OCRResult:
@@ -399,6 +828,15 @@ def extract_text(image: Image.Image, prefer: str = "paddleocr") -> OCRResult:
         text = _ocr_with_tesseract(image)
         return OCRResult(text=text, engine_used="tesseract", warning=fallback_warning)
     except Exception as e:
+        rapid = _try_load_rapidocr()
+        if rapid is not None:
+            try:
+                return OCRResult(
+                    text=_ocr_with_rapidocr(rapid, image), engine_used="rapidocr",
+                    warning=f"Tesseract unavailable ({e}); used the RapidOCR fallback.",
+                )
+            except Exception as e2:
+                return OCRResult(text="", engine_used="none", warning=f"OCR unavailable: {e2}")
         return OCRResult(text="", engine_used="none", warning=f"OCR unavailable: {e}")
 
 
@@ -428,13 +866,22 @@ def extract_lines(image: Image.Image, prefer: str = "paddleocr") -> LinesResult:
         lines = _lines_with_tesseract(image)
         return LinesResult(lines=lines, engine_used="tesseract", warning=fallback_warning)
     except Exception as e:
+        rapid = _try_load_rapidocr()
+        if rapid is not None:
+            try:
+                return LinesResult(
+                    lines=_lines_with_rapidocr(rapid, image), engine_used="rapidocr",
+                    warning=f"Tesseract unavailable ({e}); used the RapidOCR fallback.",
+                )
+            except Exception as e2:
+                return LinesResult(lines=[], engine_used="none", warning=f"OCR unavailable: {e2}")
         return LinesResult(lines=[], engine_used="none", warning=f"OCR unavailable: {e}")
 
 
 def cluster_lines_by_size(
     lines_result: LinesResult,
     jitter_tolerance_ratio: float = 0.08,
-    expected_dealer_name: str = "",
+    expected_dealer_name: Union[str, Sequence[str], None] = "",
 ) -> ClusteredLines:
     """
     Groups OCR'd lines into Headline (largest font band), Subheadline
@@ -564,7 +1011,7 @@ def cluster_lines_by_size(
 def _apply_content_aware_dealer_match(
     clustered: ClusteredLines,
     all_lines: List[TextLine],
-    expected_dealer_name: str,
+    expected_dealer_name: Union[str, Sequence[str], None],
 ) -> None:
     """
     Shared helper used by both branches of `cluster_lines_by_size()`
@@ -576,12 +1023,13 @@ def _apply_content_aware_dealer_match(
     isn't accidentally also removed). No-op if `expected_dealer_name`
     is blank or no confident match exists.
     """
-    if not expected_dealer_name or not expected_dealer_name.strip():
+    if not _as_name_list(expected_dealer_name):
         return
-    match = find_dealer_line(all_lines, expected_dealer_name)
+    match, matched_name = find_dealer_line_with_name(all_lines, expected_dealer_name)
     if match is None:
         return
     clustered.dealer_line = match
+    clustered.dealer_name_matched = matched_name
     clustered.headline_lines = [l for l in clustered.headline_lines if l is not match]
     clustered.subheadline_lines = [l for l in clustered.subheadline_lines if l is not match]
     clustered.other_lines = [l for l in clustered.other_lines if l is not match]
@@ -591,7 +1039,7 @@ def extract_clustered_text(
     image: Image.Image,
     prefer: str = "paddleocr",
     jitter_tolerance_ratio: float = 0.08,
-    expected_dealer_name: str = "",
+    expected_dealer_name: Union[str, Sequence[str], None] = "",
 ) -> Tuple[ClusteredLines, LinesResult]:
     """
     Convenience wrapper: OCRs the banner and returns both the size-based
