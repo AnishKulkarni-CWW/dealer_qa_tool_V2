@@ -1,7 +1,29 @@
+# NOTE ON LOCATION
+# ----------------
+# Streamlit only reads this file from `.streamlit/config.toml` (relative to
+# the working directory the app is launched from) or `~/.streamlit/config.toml`.
+# A `config.toml` sitting at the repo root is never read — run_app.py builds
+# a path to it but doesn't actually pass it to the CLI, so on Streamlit
+# Community Cloud the theme block below would have been ignored entirely
+# and the selected radio dots would render in Streamlit's default red.
+
 [server]
-maxUploadSize = 5120          # 5 GB in MB
-maxMessageSize = 5120         # must match or exceed maxUploadSize
-enableXsrfProtection = false  # needed for large multipart uploads
+# Streamlit Community Cloud gives the container roughly 2.7 GB of RAM in
+# total, so a 5 GB upload ceiling is not something the app could survive
+# using. A real run here is ~40 MB (a 12 MB bulletin PDF, ten ~2 MB model
+# zips and a 19 KB xlsx), so 1 GB is generous with plenty of headroom.
+#
+# Local desktop runs are unaffected: run_app.py passes
+# `--server.maxUploadSize 5120` on the command line, and CLI flags take
+# precedence over this file.
+maxUploadSize = 1024
+maxMessageSize = 1024
+
+# Left ON for the public deployment. It was disabled locally for large
+# multipart uploads, but this URL is public and XSRF protection is worth
+# keeping. If the file uploader starts failing on Cloud, set this to false
+# and redeploy — that is the one symptom it causes.
+enableXsrfProtection = true
 
 [browser]
 gatherUsageStats = false
