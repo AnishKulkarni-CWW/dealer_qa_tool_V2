@@ -1,0 +1,41 @@
+# ══════════════════════════════════════════════════════════════════════════
+# FALLBACK requirements — use this ONLY together with DELETING packages.txt
+# ══════════════════════════════════════════════════════════════════════════
+# Use this variant when Streamlit Community Cloud's apt step is broken and
+# Tesseract therefore cannot be installed. Deleting packages.txt makes Cloud
+# skip the apt step entirely, and rapidocr-onnxruntime supplies an OCR
+# engine through pip alone (it ships its ONNX models inside the wheel).
+#
+# READ THIS BEFORE USING IT — it is a downgrade, not a substitute.
+# Measured on your own four adapts, with RapidOCR reading both the Master
+# creative and the dealer email:
+#
+#   THE 7   Headline Pass
+#   THE i7  Headline Pass
+#   X7      Headline WARN  - it reads the car's number plate as banner text,
+#                            so the expected Headline came out as
+#                            "MaSE1438 ALL-IN,NO MOREEXCUSES"
+#   X1      Headline FAIL  - the giant "X1" badge outranks the real headline;
+#                            master read "X1", email read "X"
+#
+# It also runs words together throughout ("DRIVEYOURMATCHWITHBENEFITSOF5O%
+# ROADTAX.") and misreads 50% as 5O%. And because the small-type upscale,
+# the core-line-height measurement and the alignment-based debris filter all
+# live in `_lines_with_tesseract`, none of the fixes applied for X1 / X5 /
+# THE 7 / THE i7 / X3 are active on this path.
+#
+# Fine for keeping the app reachable while Streamlit fix their image.
+# Not what you want people running real QA against.
+
+streamlit>=1.31
+pandas
+beautifulsoup4
+openpyxl
+opencv-python-headless
+scikit-image
+numpy
+Pillow>=9.1
+pymupdf
+
+pytesseract              # harmless with no binary present; the code falls through
+rapidocr-onnxruntime     # pip-only OCR engine, no apt required
