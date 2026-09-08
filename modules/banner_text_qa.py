@@ -130,11 +130,34 @@ class WordDiff:
 
 
 def diff_words(expected: str, found: str, match_case: bool = False) -> WordDiff:
+    """
+    Word-level difference between the expected copy and what was OCR'd.
+
+    Matching is tolerant of OCR word-splitting and word-merging (see
+    `ocr_engine.spacing_tolerant_match`) and of nothing else. The expected
+    Headline is OCR'd from the Master creative while the found text is
+    OCR'd from the dealer's email — two renderings of the same artwork —
+    and Tesseract does not always break tightly-tracked display type at the
+    same place in both. A real case: the Master read the i7 badge line as
+    the single token "THEI7" and the email read it as "THE" + "i7", so a
+    pixel-identical banner was reported as `Missing word(s): THEI7`.
+
+    Only exact character-for-character reconciliation across CONSECUTIVE
+    tokens is accepted, so a genuinely wrong or absent word is still
+    reported as missing exactly as before.
+    """
     exp_tokens = _tokenize(expected, match_case=match_case)
-    found_tokens = set(_tokenize(found, match_case=match_case))
-    missing = [t for t in exp_tokens if t not in found_tokens]
+    found_tokens = _tokenize(found, match_case=match_case)
+    matched_exp, matched_found = _ocr_engine.spacing_tolerant_match(exp_tokens, found_tokens)
+    missing = [t for i, t in enumerate(exp_tokens) if i not in matched_exp]
+    # `extra` keeps its original, deliberately lenient set-membership rule
+    # (a word that appears anywhere in the expected copy is never "extra"),
+    # with anything the reconciliation consumed removed as well.
     exp_set = set(exp_tokens)
-    extra = [t for t in _tokenize(found, match_case=match_case) if t not in exp_set]
+    extra = [
+        t for j, t in enumerate(found_tokens)
+        if j not in matched_found and t not in exp_set
+    ]
     return WordDiff(missing=missing, extra=extra)
 
 
@@ -179,6 +202,62 @@ def _field_status(expected: str, found: str, config, match_case: bool = False,
         parts.append(f"Unexpected/extra word(s) nearby: {', '.join(wd.extra[:10])}")
     status = FAIL if matched_ratio < config.ocr_token_match_min_ratio else WARN
     return status, "; ".join(parts) if parts else "Partial match."
+
+
+
+def _dealer_field_status(expected: str, matched_line_text: str, banner_ocr_text: str,
+                         config, match_case: bool = False,
+                         space_insensitive: bool = False) -> tuple:
+    """
+    Status for the Dealer Name row.
+
+    Kept separate from `_field_status` because the "field not present at
+    all" case means something completely different for Dealer Name than it
+    does for Headline or Subheadline.
+
+    What used to happen: when no dealer-name line could be found on the
+    banner, the generic fallback chain compared the expected dealer name
+    against the WHOLE banner text blob. On a BMW template whose dealer
+    block lives in the email body — which is most of them — that produced,
+    on every single adapt:
+
+        Fail | Missing word(s): Bird, Automotive; Unexpected/extra word(s)
+             | nearby: ALL, IN, NO, MORE, EXCUSES, DRIVE, YOUR, MATCH, ...
+        Expected: Bird Automotive
+        Found:    ALL-IN, NO MORE EXCUSES. DRIVE YOUR MATCH WITH SMART ...
+
+    which is noise: it lists the headline as "extra dealer-name words",
+    duplicates the dedicated "Dealer exists in Banner" check, and buries
+    any real dealer-name defect underneath. Three honest outcomes instead:
+
+      - a dealer-name line was located  -> ordinary word-level comparison
+      - no line, but the name IS in the banner text somewhere -> WARN
+      - the name is nowhere on the banner -> one clear message, and the
+        `found` column is left empty rather than filled with the headline
+        (WARN by default; see config.banner_dealer_name_missing_is_fail)
+    """
+    if not expected.strip():
+        return WARN, "No expected value provided for this field — skipped."
+
+    if matched_line_text.strip():
+        return _field_status(expected, matched_line_text, config,
+                             match_case=match_case, space_insensitive=space_insensitive)
+
+    if banner_ocr_text.strip():
+        wd = diff_words(expected, banner_ocr_text, match_case=match_case)
+        if not wd.missing:
+            return WARN, (
+                f"'{expected.strip()}' appears in the banner text but not as its own "
+                "dealer-name line — check that it is set as a separate line on the artwork."
+            )
+
+    detail = (
+        f"No dealer-name line was found on this banner. On many BMW templates the dealer "
+        f"block sits in the email body rather than on the banner artwork — the separate "
+        f"'Dealer exists in Banner' check covers that case."
+    )
+    status = FAIL if getattr(config, "banner_dealer_name_missing_is_fail", False) else WARN
+    return status, detail
 
 
 def _strip_trailing_dealer_name(expected_text: str, dealer_name: str) -> str:
@@ -340,10 +419,18 @@ def run_banner_text_qa(
             if subheadline_found.strip():
                 used_band_fallback.append("Subheadline")
         if expected_dealer_name.strip() and not dealer_found.strip():
+            # Only a line that genuinely LOOKS like the dealer name may be
+            # used here. `other_lines` is "whatever fell into the smallest
+            # font band", which on a banner with no dealer name at all is
+            # just the subheadline or a legal strapline — accepting it made
+            # the Dealer Name row report the headline as a wrong dealer
+            # name. `find_dealer_line` is content-based, so it returns
+            # nothing when there is nothing, which is the correct answer.
             if pre_matched_dealer is not None:
                 dealer_found = pre_matched_dealer.text
             else:
-                dealer_found = " ".join(l.text for l in other_lines)
+                rescan = _ocr_engine.find_dealer_line(other_lines, expected_dealer_name)
+                dealer_found = rescan.text if rescan is not None else ""
             if dealer_found.strip():
                 used_band_fallback.append("Dealer Name")
 
@@ -358,9 +445,11 @@ def run_banner_text_qa(
         if expected_subheadline.strip() and not subheadline_found.strip():
             subheadline_found = ocr_text
             used_blob_fallback.append("Subheadline")
-        if expected_dealer_name.strip() and not dealer_found.strip():
-            dealer_found = ocr_text
-            used_blob_fallback.append("Dealer Name")
+        # NOTE: Dealer Name deliberately has NO whole-blob fallback. Falling
+        # back to the entire banner text guaranteed a Fail with a nonsense
+        # "extra words" list on every template whose dealer block lives in
+        # the email body. `_dealer_field_status` handles the not-found case
+        # explicitly and honestly instead.
 
         note_parts = [
             f"Banner lines matched to fields by content "
@@ -391,6 +480,20 @@ def run_banner_text_qa(
         subheadline_found = ocr_text
         dealer_found = ocr_text
 
+    # A master that supplied nothing at all is worth saying out loud. Left
+    # unexplained, both text rows just read "No expected value provided for
+    # this field — skipped", which looks like the user forgot to fill
+    # something in when in fact the Master banner crop or its OCR failed.
+    if (clustered_lines is not None
+            and not expected_headline.strip()
+            and not expected_subheadline.strip()):
+        result.notes.append(
+            "No expected Headline or Subheadline was available from the Master, so those "
+            "rows were skipped rather than checked. Confirm the Master banner was cropped "
+            "correctly (the crop stops at the 'Dear' salutation) and that its text is "
+            "legible — the banner text on this email was read fine."
+        )
+
     fields = [
         ("Headline", expected_headline, headline_found),
         ("Subheadline", expected_subheadline, subheadline_found),
@@ -401,8 +504,14 @@ def run_banner_text_qa(
         result.notes.append("Case-sensitive matching enabled — casing differences (e.g. \"bmw\" vs \"BMW\") count as a mismatch.")
 
     for label, expected, found_text in fields:
-        status, detail = _field_status(expected, found_text, config, match_case=match_case,
-                                       space_insensitive=space_insensitive)
+        if label == "Dealer Name":
+            status, detail = _dealer_field_status(
+                expected, found_text, ocr_text, config,
+                match_case=match_case, space_insensitive=space_insensitive,
+            )
+        else:
+            status, detail = _field_status(expected, found_text, config, match_case=match_case,
+                                           space_insensitive=space_insensitive)
         result.add("Banner Text", label, status, detail=detail, expected=expected, found=found_text[:300])
 
     return result

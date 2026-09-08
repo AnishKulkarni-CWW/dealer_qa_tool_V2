@@ -136,6 +136,89 @@ FIELD_MATCH_MIN_LINE_RATIO = 0.6
 DEALER_LINE_MAX_EXTRA_TOKENS = 2
 
 
+# --------------------------------------------------------------------------
+# Small-type auto-upscale (see `_tesseract_word_boxes`)
+# --------------------------------------------------------------------------
+# Measured on real BMW EDM banners: the model badge line ("THE i7" /
+# "THE 7") and the "BAYERISCHE MOTOREN WERKE" strapline render at 10-11px
+# in an 800px-wide email banner. At that size Tesseract:
+#   - merges words        -> "THEI7" instead of "THE i7"
+#   - misreads glyphs     -> "THE?" instead of "THE 7"
+#   - returns confidences in the teens for text that is perfectly crisp
+#   - inflates bounding boxes around apostrophes ("DON'T" measured 33px
+#     tall against 19px for "YOU" on the very same visual line), which then
+#     splits ONE headline across two font-size bands
+# Re-running OCR on an upscaled copy fixes all four at once, and because
+# the Master creative and the dealer's email are OCR'd through the same
+# path, it also makes their word-splitting AGREE — which is what stops a
+# correct banner being failed for "missing word: THEI7".
+#
+# The image is only ever upscaled when its own measured type is small, and
+# every coordinate is divided back down, so callers still work in original
+# image pixels and nothing downstream needs to know this happened.
+OCR_MIN_TEXT_HEIGHT_PX = 18.0    # below this median word height, re-OCR bigger
+OCR_TARGET_TEXT_HEIGHT_PX = 26.0  # aim for roughly this median word height
+OCR_MAX_UPSCALE = 3               # never scale beyond this (noise starts winning)
+
+# --------------------------------------------------------------------------
+# Robust per-line font size (see `_core_line_height`)
+# --------------------------------------------------------------------------
+# A line's font size must NOT be measured as `max(bottom) - min(top)` across
+# its words. One apostrophe, one descender or one stray anti-aliased pixel
+# inflates a single word's box and takes the whole line's measured size with
+# it. Real case, X1 master creative:
+#     YOU(19) MISS(19) THE(18) SHOTS(19)   -> line measured 19px
+#     YOU(19) DON'T(33) TAKE.(33)          -> line measured 33px
+# Those two lines are the SAME font on the artwork; the second is one visual
+# line of the same headline. Measuring by extents made them 74% apart, so
+# font-size banding put them in different bands and the expected Headline
+# came out as "YOU DON'T TAKE." — half of the real headline.
+#
+# Instead the font size is the SMALLEST word box on the line, ignoring
+# obviously-subscript debris. Inflation only ever makes a box bigger, so the
+# smallest box is the closest thing to the real cap height.
+CORE_HEIGHT_MIN_RATIO = 0.55
+
+# --------------------------------------------------------------------------
+# Band jitter floor (see `cluster_lines_by_size`)
+# --------------------------------------------------------------------------
+# The jitter tolerance is a percentage, which stops making sense at small
+# absolute sizes: an 11px line and a 10px line differ by 9% — over the 8%
+# tolerance — purely because of pixel quantisation, and get split into two
+# bands. Any two lines within this many pixels of each other are treated as
+# the same size regardless of the percentage. Kept deliberately small (one
+# pixel): measured on a real deck, an 11.5px badge line and a 10.5px
+# strapline are the same visual size and must merge, while a 15.5px
+# subheadline and a 13.5px legal line are genuinely different and must not.
+JITTER_TOLERANCE_MIN_PX = 2.0
+
+# --------------------------------------------------------------------------
+# Graphic-debris lines (see `_is_probable_debris_line`)
+# --------------------------------------------------------------------------
+# Upscaling makes Tesseract more willing to hallucinate 1-3 character
+# "words" out of building textures and logo edges. A hallucinated fragment
+# with a tall box can become the tallest "line" on the banner and steal the
+# Headline band. A line is discarded only when it is short AND low
+# confidence AND only one or two words — deliberately narrow, so real short
+# banner copy ("THE X1", conf 90+) is never touched.
+# A line is debris when NO word on it is longer than DEBRIS_LINE_MAX_CHARS
+# alphanumeric characters AND no word reaches DEBRIS_LINE_MAX_CONFIDENCE.
+# Measured examples this removes: "eet =e See" (confidences 0/47/36, read
+# out of a reflection on the X3 creative) and "Pr ENG" (44/44, read out of
+# a building facade). Measured examples it keeps: "THE i7" (78/87),
+# "THE7" (92) and "THEI7" (17, but five characters long).
+DEBRIS_LINE_MAX_CHARS = 3
+DEBRIS_LINE_MAX_CONFIDENCE = 50.0
+# ...but a short, unsure line that is LEFT-ALIGNED with the banner's real
+# copy is real copy. On the "THE 7" master creative the badge line comes
+# back at confidence 0 for both of its words, and dropping it cost the
+# whole expected Headline. It starts at x=51.5 against x=52.0 for the
+# strapline underneath it, whereas genuine debris ("eet =e See" read out of
+# a reflection) starts at x=380 against x=118 for the real copy. Alignment
+# separates the two cleanly where confidence and length cannot.
+DEBRIS_ALIGN_TOLERANCE_RATIO = 0.02
+
+
 @dataclass
 class OCRResult:
     text: str
@@ -218,6 +301,123 @@ class ClusteredLines:
             key=lambda l: l.top,
         )
         return "\n".join(l.text for l in all_lines)
+
+
+
+def _match_tokens(text: str, match_case: bool = False) -> List[str]:
+    """Word tokens, in reading order (duplicates preserved)."""
+    src = text or ""
+    if not match_case:
+        src = src.lower()
+    return re.findall(r"[A-Za-z0-9]+", src)
+
+
+def spacing_tolerant_match(expected_tokens: Sequence[str],
+                           found_tokens: Sequence[str]) -> Tuple[set, set]:
+    """
+    Matches two token streams while tolerating OCR word-splitting and
+    word-merging. Returns `(matched_expected_indices, matched_found_indices)`.
+
+    ----------------------------------------------------------------------
+    Why this exists
+    ----------------------------------------------------------------------
+    The expected Headline is OCR'd from the Master creative and the found
+    text is OCR'd from the dealer's email — two different renderings of the
+    SAME artwork. Tesseract does not always break tightly-tracked display
+    type at the same place in both:
+
+        Master creative : "THEI7"  "BAYERISCHE" "MOTOREN" "WERKE"
+        Dealer email    : "THE" "I7" "BAYERISCHE" "MOTOREN" "WERKE"
+
+    Plain bag-of-words comparison sees zero overlap on the first token, so
+    a pixel-perfect banner was reported as `Missing word(s): THEI7` and the
+    line was not even attributed to the Headline field. The same happens in
+    reverse with "ALL-IN,NO" vs "ALL-IN, NO".
+
+    ----------------------------------------------------------------------
+    Why it is still strict
+    ----------------------------------------------------------------------
+    A token is only ever reconciled when the characters account for each
+    other EXACTLY and the tokens involved are CONSECUTIVE — "THE" + "I7"
+    == "THEI7" is accepted; "NO" being a substring of "NOTHING" is not.
+    Nothing is matched on partial or fuzzy grounds, so a genuinely wrong
+    word is still reported as missing.
+
+    Three passes, in decreasing strength:
+      1. exact token matches (each found token consumed at most once)
+      2. split:  one expected token == 2+ consecutive unused found tokens
+      3. merge:  one found token == 2+ consecutive unused expected tokens
+    """
+    exp = list(expected_tokens)
+    fnd = list(found_tokens)
+    used_e: set = set()
+    used_f: set = set()
+    if not exp or not fnd:
+        return used_e, used_f
+
+    # Pass 1 — exact matches, first-come first-served.
+    by_text: dict = {}
+    for j, t in enumerate(fnd):
+        by_text.setdefault(t, []).append(j)
+    for i, t in enumerate(exp):
+        bucket = by_text.get(t)
+        if bucket:
+            used_e.add(i)
+            used_f.add(bucket.pop(0))
+
+    # Pass 2 — an expected token that OCR split into several found tokens.
+    for i, t in enumerate(exp):
+        if i in used_e:
+            continue
+        for j in range(len(fnd)):
+            if j in used_f:
+                continue
+            acc = ""
+            run: List[int] = []
+            k = j
+            while k < len(fnd) and k not in used_f and len(acc) < len(t):
+                acc += fnd[k]
+                run.append(k)
+                k += 1
+            if acc == t and len(run) >= 2:
+                used_e.add(i)
+                used_f.update(run)
+                break
+
+    # Pass 3 — several expected tokens that OCR merged into one found token.
+    for j, t in enumerate(fnd):
+        if j in used_f:
+            continue
+        for i in range(len(exp)):
+            if i in used_e:
+                continue
+            acc = ""
+            run = []
+            k = i
+            while k < len(exp) and k not in used_e and len(acc) < len(t):
+                acc += exp[k]
+                run.append(k)
+                k += 1
+            if acc == t and len(run) >= 2:
+                used_f.add(j)
+                used_e.update(run)
+                break
+
+    return used_e, used_f
+
+
+def tokens_covered_ratio(line_text: str, field_text: str) -> float:
+    """
+    Fraction of `line_text`'s own words that are accounted for by
+    `field_text`, tolerating OCR word split/merge (see
+    `spacing_tolerant_match`). 0.0 when the line has no words.
+    """
+    line_tokens = _match_tokens(line_text)
+    field_tokens = _match_tokens(field_text)
+    if not line_tokens or not field_tokens:
+        return 0.0
+    matched_line, _ = spacing_tolerant_match(line_tokens, field_tokens)
+    return len(matched_line) / len(line_tokens)
 
 
 def _dealer_name_tokens(text: str) -> set:
@@ -439,17 +639,20 @@ def assign_lines_by_content(
     assignment.dealer_line = dealer_line
     assignment.dealer_name_matched = dealer_name
 
-    h_tokens = _dealer_name_tokens(expected_headline)
-    s_tokens = _dealer_name_tokens(expected_subheadline)
-
     for line in lines:
         if line is dealer_line:
             continue
-        l_tokens = _dealer_name_tokens(line.text)
-        if not l_tokens:
+        if not _match_tokens(line.text):
             continue
-        h_ratio = len(l_tokens & h_tokens) / len(l_tokens) if h_tokens else 0.0
-        s_ratio = len(l_tokens & s_tokens) / len(l_tokens) if s_tokens else 0.0
+        # Spacing-tolerant on purpose: the expected text comes from OCR of
+        # the Master creative and the line comes from OCR of the dealer's
+        # email, and the two do not always split tightly-tracked display
+        # type at the same place ("THEI7" vs "THE i7"). Without this the
+        # line matched no field at all, landed in `unmatched_lines`, and
+        # the Headline was reported as missing a word that was right there
+        # on the artwork. See `spacing_tolerant_match`.
+        h_ratio = tokens_covered_ratio(line.text, expected_headline)
+        s_ratio = tokens_covered_ratio(line.text, expected_subheadline)
         if h_ratio >= min_line_ratio and h_ratio >= s_ratio:
             assignment.headline_lines.append(line)
         elif s_ratio >= min_line_ratio:
@@ -583,24 +786,38 @@ def _median(values: List[float]) -> float:
     return (float(ordered[mid - 1]) + float(ordered[mid])) / 2.0
 
 
-def _filter_line_words(words: List[dict]) -> List[dict]:
+def _measurement_words(words: List[dict]) -> List[dict]:
     """
-    Removes graphic debris from one Tesseract line group before its font
-    height is measured. See the "Line hygiene" section of the module
-    docstring for the case this exists for (a BMW roundel logo OCR'ing as
-    'oD)' at confidence 24 with a 75px box, glued onto a line of 22px
-    headline words, tripling that line's measured font height and wrecking
-    the font-size banding for the whole banner).
+    Picks the subset of one Tesseract line's words that may be used to
+    MEASURE that line's font size. See the "Line hygiene" section of the
+    module docstring for the case this exists for (a BMW roundel logo
+    OCR'ing as 'oD)' at confidence 24 with a 75px box, glued onto a line of
+    22px headline words, tripling that line's measured font height and
+    wrecking the font-size banding for the whole banner).
+
+    IMPORTANT — this no longer decides the line's TEXT.
+    ------------------------------------------------------------------
+    It used to. That was a bug, and a bad one. Both passes below can and do
+    reject real banner copy: on the X1 email banner Tesseract returns
+
+        YOU(h26,conf88) MISS(h26,96) THE(h26,96) SHOTS(h26,96)
+        YOU(h26,97) DON'T(h59,94) TAKE.(h59,25)
+
+    where the apostrophe inflates DON'T's box to 59px and TAKE. comes back
+    at confidence 25 because it sits over a dark photo. The confidence pass
+    deleted TAKE., the height pass deleted DON'T, and the line's text became
+    "YOU MISS THE SHOTS YOU" — so a perfectly correct banner was reported
+    as missing two of its own words, while `extract_text()`'s flat blob
+    (which never ran these filters) still showed the full, correct string.
+    The two code paths openly disagreed with each other.
+
+    Measuring and reading are now separated: this function is only ever used
+    to work out how big the type is. The line keeps every word it OCR'd.
 
     Two independent passes, each of which REFUSES to empty the line:
       1. confidence — drop anything below MIN_WORD_CONFIDENCE
       2. height outliers — drop anything whose box height is far from the
          median height of the (surviving) words on this line
-    The "never empty the line" rule is what keeps this safe: genuinely
-    hard-to-read banner copy (light text over a photo) may OCR at low
-    confidence across the whole line, and dropping it would turn a
-    readable line into a missing one. In that case the line is kept exactly
-    as it was, and behaviour is identical to before this filter existed.
     """
     if not words:
         return words
@@ -626,72 +843,269 @@ def _filter_line_words(words: List[dict]) -> List[dict]:
     return in_range if in_range else kept
 
 
-def _lines_with_tesseract(image: Image.Image) -> List[TextLine]:
+def _core_line_height(words: List[dict]) -> float:
+    """
+    The line's font size, measured robustly (see CORE_HEIGHT_MIN_RATIO).
+
+    Takes the SMALLEST word box on the line rather than the line's overall
+    top-to-bottom extent, ignoring anything small enough to be subscript
+    debris. Bounding-box inflation from apostrophes, descenders and
+    anti-aliasing only ever makes a box taller, never shorter, so the
+    smallest box on a line of same-size type is the closest available
+    estimate of the real cap height — and, crucially, it is the same
+    estimate for a line with an apostrophe in it as for one without.
+    """
+    heights = [float(w["height"]) for w in words if float(w["height"]) > 0]
+    if not heights:
+        return 1.0
+    med = _median(heights)
+    core = [h for h in heights if h >= CORE_HEIGHT_MIN_RATIO * med]
+    return max(min(core) if core else med, 1.0)
+
+
+def _is_probable_debris_line(words: List[dict], text: str) -> bool:
+    """
+    True for a line that is almost certainly a hallucinated fragment of
+    artwork rather than banner copy (see DEBRIS_LINE_MAX_* constants).
+
+    Both conditions must hold — no word longer than
+    DEBRIS_LINE_MAX_CHARS alphanumeric characters, and no word at or above
+    DEBRIS_LINE_MAX_CONFIDENCE. Real banner copy clears at least one of the
+    two: a short "THE i7" badge line comes back at confidence 78-87, and a
+    low-confidence "THEI7" is five characters long. Only scraps that are
+    both short and unsure — "eet =e See", "Pr ENG", "a" — are discarded.
+
+    This matters more than it looks: such a scrap becomes a TextLine with a
+    font height of its own, and font-size banding will happily hand it a
+    band, so a reflection in a photograph can end up as the expected
+    Subheadline for every dealer version of a campaign.
+    """
+    longest = 0
+    best_conf = 0.0
+    for w in words:
+        longest = max(longest, len(re.sub(r"[^A-Za-z0-9]", "", w["text"] or "")))
+        try:
+            best_conf = max(best_conf, float(w["conf"]))
+        except (TypeError, ValueError):
+            return False
+    if longest > DEBRIS_LINE_MAX_CHARS:
+        return False
+    return best_conf < DEBRIS_LINE_MAX_CONFIDENCE
+
+
+def _tesseract_data(image: Image.Image, config: str = "") -> dict:
     import pytesseract
     _configure_tesseract_path_if_needed(pytesseract)
+    return pytesseract.image_to_data(
+        image.convert("RGB"), output_type=pytesseract.Output.DICT, config=config
+    )
 
-    rgb = image.convert("RGB")
-    data = pytesseract.image_to_data(rgb, output_type=pytesseract.Output.DICT)
 
-    # Group word-level boxes into lines using tesseract's own
-    # block/par/line numbering. Word boxes are kept individually at this
-    # stage (rather than being collapsed into a running min-top/max-bottom
-    # immediately, as the old code did) precisely so that _filter_line_words
-    # can drop debris BEFORE the line's font height is measured — once the
-    # boxes are merged, a junk box is indistinguishable from a tall letter.
-    line_groups = {}
+def _word_boxes(data: dict) -> List[dict]:
+    """Flattens Tesseract's parallel-array output into word dicts."""
+    boxes: List[dict] = []
     n = len(data.get("text", []))
+    confs = data.get("conf", ["-1"] * n)
     for i in range(n):
         word = (data["text"][i] or "").strip()
         if not word:
             continue
-        conf = data.get("conf", ["-1"] * n)[i]
+        conf = confs[i]
         try:
             if float(conf) < 0:
                 continue
         except (ValueError, TypeError):
             pass
-        # Skip isolated punctuation/symbol-only tokens (e.g. a stray ")"
-        # picked up from a logo edge or icon) so they don't get glued
-        # onto the front/back of real headline/subheadline text.
-        if not re.search(r"[A-Za-z0-9]", word):
-            continue
-        key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
-        line_groups.setdefault(key, []).append({
+        boxes.append({
             "text": word,
             "top": float(data["top"][i]),
             "height": float(data["height"][i]),
             "left": float(data["left"][i]),
             "conf": conf,
+            "key": (data["block_num"][i], data["par_num"][i], data["line_num"][i]),
         })
+    return boxes
 
-    lines: List[TextLine] = []
-    for words in line_groups.values():
-        kept = _filter_line_words(words)
-        kept = sorted(kept, key=lambda w: w["left"])
-        text = " ".join(w["text"] for w in kept).strip()
-        if not text:
+
+def _group_boxes_into_lines(boxes: List[dict]) -> List[List[dict]]:
+    """Groups word boxes by Tesseract's own block/paragraph/line numbering,
+    dropping symbol-only tokens (logo edges, icon fragments) first."""
+    groups: dict = {}
+    for w in boxes:
+        if not re.search(r"[A-Za-z0-9]", w["text"]):
             continue
-        # Drop lines that are pure punctuation/symbol noise (e.g. a stray
-        # ")" or "|" picked up from a logo edge or icon) — they carry no
-        # real word content and would otherwise get glued onto the front
-        # of whatever real headline text follows, corrupting the match.
-        if not re.search(r"[A-Za-z0-9]", text):
+        groups.setdefault(w["key"], []).append(w)
+    return [sorted(ws, key=lambda w: w["left"]) for ws in groups.values()]
+
+
+def _upscale_factor_for(boxes: List[dict]) -> int:
+    """
+    How much to enlarge the image before re-OCR'ing it, based on how big
+    its type actually measured on the first pass. 1 means "leave it alone".
+    See the OCR_MIN_TEXT_HEIGHT_PX block for the measured cases this fixes.
+
+    The decision is made on the median of the LINES' font sizes, not the
+    median word height. A per-word median is dominated by whichever line
+    happens to have the most words on it: on a real X1 banner the 9-word
+    legal strapline (13px) outvoted the 5-word headline (26px), giving a
+    per-word median of 13 and triggering an upscale the banner did not
+    need — which then had Tesseract hallucinating "Pr"/"ENG" out of the
+    building in the photograph. One vote per line is the honest measure of
+    "is the type on this banner small".
+    """
+    line_heights = [_core_line_height(ws) for ws in _group_boxes_into_lines(boxes)]
+    line_heights = [h for h in line_heights if h > 0]
+    if not line_heights:
+        return 1
+    med = _median(line_heights)
+    if med <= 0 or med >= OCR_MIN_TEXT_HEIGHT_PX:
+        return 1
+    factor = int(round(OCR_TARGET_TEXT_HEIGHT_PX / med))
+    return max(2, min(OCR_MAX_UPSCALE, factor))
+
+
+def _tesseract_word_boxes(image: Image.Image) -> Tuple[List[dict], int]:
+    """
+    OCRs `image` and returns `(word_boxes, scale_used)`.
+
+    When the first pass shows the type is too small to read reliably, the
+    image is enlarged and OCR'd again — and every coordinate is divided
+    back down, so the boxes are always expressed in ORIGINAL image pixels
+    and no caller has to know this happened.
+
+    Both `extract_lines()` and `extract_text()` go through here, which is
+    deliberate: they used to run two different Tesseract calls with two
+    different sets of filters and could return contradictory text for the
+    same banner (the flat blob showed a word that the per-line output had
+    silently dropped). One source of truth removes that whole class of bug.
+    """
+    boxes = _word_boxes(_tesseract_data(image))
+    factor = _upscale_factor_for(boxes)
+    if factor <= 1:
+        return boxes, 1
+
+    try:
+        big = image.convert("RGB")
+        big = big.resize((big.width * factor, big.height * factor), Image.LANCZOS)
+        big_boxes = _word_boxes(_tesseract_data(big))
+    except Exception:
+        return boxes, 1
+    if not big_boxes:
+        return boxes, 1
+
+    for w in big_boxes:
+        w["top"] /= factor
+        w["height"] /= factor
+        w["left"] /= factor
+    return big_boxes, factor
+
+
+def _line_longest_word(words: List[dict]) -> int:
+    return max((len(re.sub(r"[^A-Za-z0-9]", "", w["text"] or "")) for w in words), default=0)
+
+
+def _line_best_confidence(words: List[dict]) -> float:
+    best = 0.0
+    for w in words:
+        try:
+            best = max(best, float(w["conf"]))
+        except (TypeError, ValueError):
+            return 100.0
+    return best
+
+
+def _drop_debris_lines(entries, image_width: float):
+    """
+    Removes hallucinated scraps of artwork from a banner's line list.
+
+    `entries` is a list of `(TextLine, words)`. A line is only a candidate
+    for removal when it is BOTH short and unsure (see DEBRIS_LINE_MAX_*),
+    and even then it is kept if it is left-aligned with any confident line
+    on the banner — banner copy is set flush to a common left edge, stray
+    OCR of a photograph is not. If the banner has no confident line at all,
+    nothing is dropped: a hard-to-read banner must never come back empty.
+    """
+    confident = [
+        (tl, ws) for tl, ws in entries
+        if _line_longest_word(ws) > DEBRIS_LINE_MAX_CHARS
+        and _line_best_confidence(ws) >= DEBRIS_LINE_MAX_CONFIDENCE
+    ]
+    if not confident:
+        return entries
+
+    tolerance = max(image_width * DEBRIS_ALIGN_TOLERANCE_RATIO, 2.0)
+    confident_lefts = [min(w["left"] for w in ws) for _tl, ws in confident]
+
+    kept = []
+    for tl, ws in entries:
+        if not _is_probable_debris_line(ws, tl.text):
+            kept.append((tl, ws))
             continue
-        top = min(w["top"] for w in kept)
-        bottom = max(w["top"] + w["height"] for w in kept)
-        height = max(bottom - top, 1.0)
+        left = min(w["left"] for w in ws)
+        if any(abs(left - ref) <= tolerance for ref in confident_lefts):
+            kept.append((tl, ws))
+    return kept
+
+
+def _lines_with_tesseract(image: Image.Image) -> List[TextLine]:
+    """
+    Groups Tesseract's word boxes into lines using its own
+    block/paragraph/line numbering.
+
+    The line KEEPS EVERY WORD IT OCR'D. Only the font-size measurement is
+    taken from the filtered subset (`_measurement_words`) — see that
+    function for why conflating the two silently deleted real headline
+    words from perfectly correct banners.
+    """
+    boxes, _scale = _tesseract_word_boxes(image)
+
+    entries = []
+    # `_group_boxes_into_lines` already drops isolated punctuation/symbol
+    # tokens (e.g. a stray ")" from a logo edge) so they don't get glued
+    # onto the front/back of real headline/subheadline text.
+    for words in _group_boxes_into_lines(boxes):
+        text = " ".join(w["text"] for w in words).strip()
+        if not text or not re.search(r"[A-Za-z0-9]", text):
+            continue
+        measured = _measurement_words(words)
+        height = _core_line_height(measured)
+        top = min(w["top"] for w in measured)
+        bottom = max(w["top"] + w["height"] for w in measured)
         center_y = (top + bottom) / 2.0
-        lines.append(TextLine(text=text, height=height, top=top, center_y=center_y))
+        entries.append((TextLine(text=text, height=height, top=top, center_y=center_y), words))
 
+    entries = _drop_debris_lines(entries, float(image.width))
+    lines = [tl for tl, _ws in entries]
     lines.sort(key=lambda l: l.top)
     return lines
 
 
 def _ocr_with_tesseract(image: Image.Image) -> str:
-    import pytesseract
-    _configure_tesseract_path_if_needed(pytesseract)
-    return pytesseract.image_to_string(image.convert("RGB"))
+    """
+    Flat, top-to-bottom banner text. Rebuilt from the SAME word boxes
+    `_lines_with_tesseract()` uses, so the flat "found" text and the
+    per-field "found" text can never contradict each other, and so the blob
+    benefits from the small-type upscale too.
+    """
+    boxes, _scale = _tesseract_word_boxes(image)
+    if not boxes:
+        import pytesseract
+        _configure_tesseract_path_if_needed(pytesseract)
+        return pytesseract.image_to_string(image.convert("RGB"))
+
+    entries = []
+    for ws in _group_boxes_into_lines(boxes):
+        line = " ".join(w["text"] for w in ws).strip()
+        if not line:
+            continue
+        entries.append((TextLine(text=line, height=1.0,
+                                 top=min(w["top"] for w in ws),
+                                 center_y=min(w["top"] for w in ws)), ws))
+    # Same debris pass the per-line path uses, so the flat text and the
+    # per-field text stay consistent with each other.
+    entries = _drop_debris_lines(entries, float(image.width))
+    entries.sort(key=lambda e: (e[0].top, min(w["left"] for w in e[1])))
+    return "\n".join(tl.text for tl, _ws in entries)
 
 
 
@@ -901,10 +1315,16 @@ def cluster_lines_by_size(
     Instead, this uses a "biggest relative gap" cut-point approach that
     adapts to whatever size differences actually exist on THIS banner:
       1. Merge lines whose heights are within `jitter_tolerance_ratio`
-         (default 8%) of each other into the same "distinct size" group
-         first — this absorbs pure OCR measurement noise between two
-         lines that are visually the same font size (e.g. a wrapped
-         2-line Headline), without conflating genuinely different sizes.
+         (default 8%) OR within `JITTER_TOLERANCE_MIN_PX` pixels of each
+         other into the same "distinct size" group first — this absorbs
+         pure OCR measurement noise between two lines that are visually
+         the same font size (e.g. a wrapped 2-line Headline), without
+         conflating genuinely different sizes. Line heights arrive here
+         from `_core_line_height()`, which measures the smallest word box
+         on the line rather than the line's overall extent — without that,
+         a single apostrophe was enough to make one visual line of a
+         headline measure 74% taller than the line above it and land in a
+         different band.
       2. Take the resulting distinct size groups, sorted largest to
          smallest, and compute the proportional gap between each
          consecutive pair.
@@ -955,8 +1375,14 @@ def cluster_lines_by_size(
             size_groups.append([line])
             group_anchor_height = line.height
         else:
-            drop = (group_anchor_height - line.height) / group_anchor_height if group_anchor_height > 0 else 0
-            if drop > jitter_tolerance_ratio:
+            delta = group_anchor_height - line.height
+            drop = delta / group_anchor_height if group_anchor_height > 0 else 0
+            # A percentage tolerance alone stops working at small absolute
+            # sizes: an 11px line and a 10px line are 9% apart — over the 8%
+            # tolerance — purely because of pixel quantisation, and used to
+            # be split into two different bands. Anything within
+            # JITTER_TOLERANCE_MIN_PX is the same size, whatever the ratio.
+            if drop > jitter_tolerance_ratio and delta > JITTER_TOLERANCE_MIN_PX:
                 size_groups.append([line])
                 group_anchor_height = line.height
             else:

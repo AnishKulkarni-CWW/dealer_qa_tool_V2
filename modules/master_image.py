@@ -54,17 +54,90 @@ def _find_anchor_y_paddle(image: Image.Image, anchor_word: str) -> Optional[int]
     return None
 
 
+# Tesseract page-segmentation modes tried, in order, when hunting for the
+# salutation anchor. The default (PSM 3, full auto) is not enough on real
+# master creatives: on the "THE 7" emailer page of a live BMW bulletin it
+# returned only four words for the entire 851x1472 image and missed a
+# "Dear Patron," that is perfectly legible — while PSM 6 ("assume a single
+# uniform block of text") found it at confidence 97. A big photograph above
+# the copy is all it takes to throw the automatic segmenter off.
+_ANCHOR_PSM_CONFIGS = ("", "--psm 6", "--psm 11")
+
+# If no configuration finds the anchor at native size, try once more on an
+# enlarged copy — small body copy is the other reason the word goes missing.
+_ANCHOR_UPSCALE = 2
+
+
+def _anchor_hit(word: str, anchor_word: str) -> bool:
+    """
+    True when `word` is the salutation anchor, allowing for one OCR slip.
+
+    Exact substring first (the original rule, unchanged). Failing that, a
+    single-character edit is tolerated on words of the same length, because
+    a missed "Dear" costs the whole banner: the crop silently falls back to
+    a fixed fraction of the image height, which on a real BMW emailer cut
+    the banner text off entirely and left Headline and Subheadline with no
+    expected value at all. One edit is tight enough that ordinary body copy
+    never trips it.
+    """
+    w = (word or "").strip().lower()
+    a = (anchor_word or "").strip().lower()
+    if not w or not a:
+        return False
+    if a in w:
+        return True
+    if len(a) < 4 or len(w) != len(a):
+        return False
+    return sum(1 for x, y in zip(w, a) if x != y) <= 1
+
+
+def _scan_data_for_anchor(data: dict, anchor_word: str, scale: int) -> Optional[int]:
+    n = len(data.get("text", []))
+    for i in range(n):
+        if _anchor_hit(data["text"][i], anchor_word):
+            return int(float(data["top"][i]) / scale)
+    return None
+
+
 def _find_anchor_y_tesseract(image: Image.Image, anchor_word: str) -> Optional[int]:
+    """
+    Locates the salutation line, trying several Tesseract page-segmentation
+    modes and then an upscaled pass before giving up. A single default-mode
+    call is not reliable enough — see `_ANCHOR_PSM_CONFIGS`.
+    """
     import pytesseract
     from .ocr_engine import _configure_tesseract_path_if_needed
 
     _configure_tesseract_path_if_needed(pytesseract)
-    data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
-    n = len(data.get("text", []))
-    for i in range(n):
-        word = (data["text"][i] or "").strip().lower()
-        if anchor_word in word:
-            return int(data["top"][i])
+    rgb = image.convert("RGB")
+
+    for cfg in _ANCHOR_PSM_CONFIGS:
+        try:
+            data = pytesseract.image_to_data(
+                rgb, output_type=pytesseract.Output.DICT, config=cfg
+            )
+        except Exception:
+            continue
+        y = _scan_data_for_anchor(data, anchor_word, 1)
+        if y is not None:
+            return y
+
+    try:
+        big = rgb.resize(
+            (rgb.width * _ANCHOR_UPSCALE, rgb.height * _ANCHOR_UPSCALE), Image.LANCZOS
+        )
+    except Exception:
+        return None
+    for cfg in _ANCHOR_PSM_CONFIGS:
+        try:
+            data = pytesseract.image_to_data(
+                big, output_type=pytesseract.Output.DICT, config=cfg
+            )
+        except Exception:
+            continue
+        y = _scan_data_for_anchor(data, anchor_word, _ANCHOR_UPSCALE)
+        if y is not None:
+            return y
     return None
 
 
@@ -77,6 +150,59 @@ def find_anchor_y(image: Image.Image, anchor_word: str) -> Optional[int]:
         return _find_anchor_y_tesseract(image, anchor_word)
     except Exception:
         return None
+
+
+def _strip_has_text(image: Image.Image, top: int, bottom: int) -> bool:
+    """True if OCR finds any real word in the horizontal strip [top, bottom)."""
+    if bottom <= top:
+        return False
+    try:
+        import pytesseract
+        from .ocr_engine import _configure_tesseract_path_if_needed
+
+        _configure_tesseract_path_if_needed(pytesseract)
+        strip = image.convert("RGB").crop((0, top, image.width, bottom))
+        if strip.height < 4:
+            return False
+        text = pytesseract.image_to_string(strip, config="--psm 6")
+    except Exception:
+        return False
+    return any(ch.isalnum() for ch in text)
+
+
+def _fallback_crop_height(image: Image.Image, config) -> int:
+    """
+    Height to use when the salutation anchor could not be found.
+
+    Starts at the configured fallback fraction, but will not hand back a
+    banner region with no text in it at all. A blind fixed fraction was
+    cutting the banner copy off a real BMW "THE 7" master creative: the
+    banner text sits at 35% of the image height, the fallback cropped at
+    exactly 35%, and the resulting "banner" contained nothing but a
+    photograph. Headline and Subheadline then came back empty and the QA
+    report said "No expected value provided for this field" for a master
+    that was perfectly readable.
+
+    So the strip below the initial cut is examined in small steps and the
+    crop is extended only until text appears — which lands on the banner
+    copy, well above the body, and stops immediately.
+    """
+    start = int(image.height * config.crop_anchor_fallback_ratio)
+    limit = int(image.height * getattr(config, "crop_anchor_fallback_max_ratio", 0.60))
+    step_ratio = getattr(config, "crop_anchor_fallback_step_ratio", 0.05)
+    step = max(int(image.height * step_ratio), 1)
+
+    if _strip_has_text(image, 0, start):
+        return start
+    y = start
+    while y < limit:
+        nxt = min(y + step, limit)
+        if _strip_has_text(image, y, nxt):
+            # Text starts inside this strip — take the whole strip so the
+            # line is never cut in half, then stop.
+            return nxt
+        y = nxt
+    return start
 
 
 def crop_banner_top_to_dear(image: Image.Image, config=DEFAULT_CONFIG) -> CropOutcome:
@@ -96,15 +222,17 @@ def crop_banner_top_to_dear(image: Image.Image, config=DEFAULT_CONFIG) -> CropOu
             note=f"Cropped banner from top to detected '{config.crop_anchor_word}' at y={anchor_y}px.",
         )
 
-    fallback_y = int(image.height * config.crop_anchor_fallback_ratio)
+    fallback_y = _fallback_crop_height(image, config)
     crop = image.crop((0, 0, image.width, fallback_y))
+    pct = int(round(100.0 * fallback_y / max(image.height, 1)))
     return CropOutcome(
         banner_image=crop,
         anchor_found=False,
         anchor_y=None,
         note=(
             f"Could not locate the word '{config.crop_anchor_word}' via OCR — "
-            f"fell back to cropping the top {int(config.crop_anchor_fallback_ratio * 100)}% "
-            f"of the image ({fallback_y}px) as the banner region."
+            f"fell back to cropping the top {pct}% of the image ({fallback_y}px) "
+            f"as the banner region, extended as needed until banner text was "
+            f"actually inside the crop."
         ),
     )
