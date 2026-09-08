@@ -1,22 +1,28 @@
-# ── Core app ──────────────────────────────────────────────────────────────
-streamlit>=1.31          # st.dialog (the QA table "Expand" popup) requires 1.31+
+# Existing app dependencies
+streamlit>=1.31  # st.dialog (the QA table "Expand" popup) requires 1.31+
 pandas
 beautifulsoup4
-openpyxl                 # Excel read (dealer panel) + Excel report writing
+openpyxl
 
-# ── Advanced QA modules ───────────────────────────────────────────────────
-opencv-python-headless   # banner_compare.py; headless build needs no libGL
-scikit-image             # banner_compare.py (structural_similarity)
+# New — Advanced QA modules
+opencv-python-headless
+scikit-image
 numpy
-Pillow>=9.1              # LANCZOS resampling used by the OCR upscale path
-pytesseract              # needs the tesseract-ocr apt package (see packages.txt)
-pymupdf                  # `import fitz` — master PDF page routing and rendering
+Pillow
+pdf2image
+pytesseract
+pymupdf  # required for mixed-PDF master page auto-detection — used by both visual_qa.find_email_page_in_pdf and modules/master_pdf.py (import fitz)
 
-# pdf2image was removed: nothing in the codebase imports it (grepped every
-# module), and it was the only reason poppler-utils was in packages.txt.
-
-# ── Deliberately NOT installed: PaddleOCR ─────────────────────────────────
-# The OCR layer falls back to Tesseract automatically when PaddleOCR is
-# absent, and Tesseract is what this app has been tuned against. Between
-# wheels and first-use model downloads, paddleocr + paddlepaddle will
-# exhaust a Community Cloud container.
+# Optional but recommended — better OCR accuracy/speed than Tesseract.
+# NOT included in this file's automatic install because paddlepaddle does
+# not yet publish wheels for every Python version (e.g. Python 3.14 on
+# Windows will fail with "No matching distribution found for paddlepaddle").
+# If you skip this package, the app automatically falls back to
+# pytesseract with no code changes — nothing else in this file needs it.
+#
+# To try it manually, first check your Python version:
+#   python --version
+# Then, ONLY if you are on Python 3.9–3.12, run:
+#   pip install paddleocr paddlepaddle
+# If that fails with "No matching distribution", your Python version isn't
+# supported by paddlepaddle yet — just skip it, Tesseract will be used.
