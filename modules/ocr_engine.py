@@ -762,6 +762,19 @@ def _configure_tesseract_path_if_needed(pytesseract_module) -> None:
     if shutil.which("tesseract"):
         return  # already on PATH, nothing to do
 
+    # Hosts where apt is unavailable or broken (notably Streamlit Community
+    # Cloud, whose build image currently fails `apt-get update` on an expired
+    # Debian bullseye security repo) can still get a real Tesseract. This
+    # downloads a self-contained build once and caches it; it is a no-op on
+    # any machine that already has one, and it never raises — a False return
+    # just leaves the RapidOCR fallback below to do its job.
+    try:
+        from .tesseract_bootstrap import ensure_tesseract
+        if ensure_tesseract():
+            return
+    except Exception:
+        pass
+
     if sys.platform.startswith("win"):
         import os
         candidates = [
